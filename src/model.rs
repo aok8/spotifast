@@ -126,6 +126,7 @@ pub enum Page {
     /// seed's URI.
     Radio(String),
     Queue,
+    Rotation,
     Settings,
 }
 
@@ -147,6 +148,7 @@ impl Page {
             Page::Show(id) => format!("show:{id}"),
             Page::Radio(seed) => format!("radio:{seed}"),
             Page::Queue => "queue".into(),
+            Page::Rotation => "rotation".into(),
             Page::Settings => "settings".into(),
         }
     }
@@ -163,6 +165,7 @@ impl Page {
             "podcasts" => Page::Podcasts,
             "episodes" => Page::Episodes,
             "queue" => Page::Queue,
+            "rotation" => Page::Rotation,
             "settings" => Page::Settings,
             other => {
                 let (kind, id) = other.split_once(':')?;
@@ -1024,6 +1027,10 @@ pub struct Toast {
 /// Actions emitted while drawing and applied afterward to avoid borrow conflicts.
 #[derive(Clone, Debug)]
 pub enum Action {
+    /// The isolated Rotation playlist workflow.
+    Rotation(crate::rotation::Request),
+    RotationPlay(usize),
+    RotationSelectDevice(String),
     Open(Page),
     /// Opens the radio of a song shown in a list, after caching the row's
     /// song so the page has its name and cover (#644).

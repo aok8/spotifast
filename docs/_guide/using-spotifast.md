@@ -5,6 +5,64 @@ description: Play music, arrange playlists, find lyrics, and make Spotifast your
 nav_order: 3
 ---
 
+## Rotation
+
+Rotation is a preview feature and currently uses English. Open **Rotation** in
+the sidebar to work through a playlist one song at a time.
+Choose a **Source playlist** and an optional, different **History playlist**,
+then choose **Use playlists**. You need permission to edit each playlist that
+Rotation will change. **None** means removed songs are not archived.
+
+Rotation saves one shuffled order for your Spotify account, including separate
+occurrences of repeated songs. The order and current position survive closing
+the app. **Restart rotation** reads the source again and makes a new order.
+Changing playlists starts a new rotation too. Local files, unavailable tracks
+and podcast episodes are excluded.
+
+Choose an unrestricted playback device in Rotation, then press **Play**.
+Rotation sends the selected song through Spotify Connect and checks the chosen
+device before reporting playback. A request Spotify accepts can still fail to
+start on the device; Rotation shows that uncertainty. **Next** and **Previous**
+move through the saved order and never edit playlists. With no device selected,
+they only change the selected song. Play on a verified active device submits up
+to 20 songs in the saved order with Shuffle and Repeat off. An inactive or
+unconfirmed device starts with one song; deliberate Play or Next can expand the
+window after Spotify confirms its state. Next and Previous deliberately start
+from the chosen position rather than skipping an unverified Spotify queue.
+
+**Pause** pauses the selected song on the chosen device. When that device still
+reports the same paused song, **Resume** continues from its paused position and
+keeps the submitted order. **Play** deliberately restarts the selected song.
+If the device or song changed, use Play to restore the rotation.
+
+While its submitted window matches the chosen device, Rotation checks live
+playback across app pages and advances the saved position
+only when the chosen device is playing a uniquely matching song within the
+submitted window. Repeated URIs cannot identify a particular occurrence, so
+Rotation asks you to use its own Next instead of guessing. Device, playback
+mode or outside-window changes stop synchronization and offer deliberate Play
+to restore the order. The window is not refilled automatically; use Play or
+Next when you reach its end.
+
+**Remove and skip** asks you to confirm the song and whether it will be archived.
+Rotation checks that the source has not changed and that the song's URI occurs
+exactly once, including unavailable copies. If history is selected, it adds the
+song there first, then checks the source again before deleting. Only a confirmed
+source deletion removes the song from the rotation and starts the next song on
+the chosen device. At the end, Rotation pauses the removed song only if that
+device is still playing it. Duplicated songs can be played and skipped but
+cannot be removed through Rotation.
+
+If the archive succeeds but source deletion fails, **Retry source removal**
+retries only deletion. An uncertain archive write is never repeated automatically:
+check the history playlist in Spotify, then explicitly choose removal without
+another archive add. If deletion is uncertain or the source changed, check both
+playlists in Spotify before using the recovery reload. That reload requires your
+acknowledgement and starts a fresh order. Do not delete the saved Rotation state
+while an edit still needs recovery. Playback timeouts and service errors start
+a ten-second cooldown before another attempt; Spotify rate limits are also
+respected.
+
 ## Middle-click autoscroll
 
 On Windows, since 0.8.0, and on Linux once turned on, middle-click anywhere

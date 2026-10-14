@@ -26,6 +26,11 @@ current release.
   directory. A copy started from the Windows ZIP keeps them, its state and
   its caches in `spotifast-data` next to it, so anyone who can read that
   folder, on a shared USB drive say, can read them.
+- **Rotation.** Playlist choices, song metadata, saved shuffled order, the
+  submitted playback window and device identifier, cooldown expiry, and edit
+  recovery status stay in an account-scoped file in the state directory.
+  Rotation uses the existing Spotify sign-ins and sends playlist reads, archive
+  additions, source deletions and playback commands to Spotify when requested.
 - **Caches.** Downloaded audio, artwork, lyrics and library metadata live in
   the cache directory and can be deleted at any time.
 - **Log.** `spotifast.log` records errors and diagnostics. It stays on your

@@ -17,6 +17,7 @@ pub mod player_bar;
 mod prerelease;
 pub mod queue;
 pub mod radio;
+pub mod rotation;
 pub mod search;
 pub mod settings;
 pub mod show;
@@ -279,7 +280,7 @@ fn central(app: &mut App, ui: &mut egui::Ui) {
             let page = app.page().clone();
             let overview = matches!(
                 page,
-                Page::Home | Page::Search | Page::Settings | Page::Queue
+                Page::Home | Page::Search | Page::Settings | Page::Queue | Page::Rotation
             );
             // The wash belongs to the page's hero, so it scrolls away with
             // it. The page's offset is known once it has been laid out, so
@@ -329,6 +330,7 @@ fn central(app: &mut App, ui: &mut egui::Ui) {
                                 Page::Show(id) => show::show(app, ui, &id),
                                 Page::Radio(seed) => radio::radio(app, ui, &seed),
                                 Page::Queue => queue::page(app, ui),
+                                Page::Rotation => rotation::show(app, ui),
                                 Page::Settings => settings::show(app, ui),
                             }
                         });

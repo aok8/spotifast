@@ -669,6 +669,10 @@ pub fn autostart() -> fastframe_autostart::Autostart {
 }
 
 pub enum Command {
+    Rotation {
+        request: u64,
+        action: crate::rotation::Request,
+    },
     OpenThemesFolder,
     /// Read or change the login registration, off the UI thread: it reads
     /// and writes a file, the registry or D-Bus, and the Flatpak portal may
@@ -934,6 +938,11 @@ pub enum Event {
     LocalFiles {
         folder: std::path::PathBuf,
         uris: Arc<HashSet<String>>,
+    },
+    Rotation {
+        request: u64,
+        account_id: String,
+        result: Result<Box<crate::rotation::State>, String>,
     },
     ProxyRestored {
         config: ProxyConfig,
@@ -1776,6 +1785,7 @@ struct Worker {
     /// Reopening or refreshing the picker reuses an in-flight browse.
     receiver_discovery: Option<tokio::task::JoinHandle<()>>,
     background_session: Arc<tokio::sync::Semaphore>,
+    rotation_lock: Arc<tokio::sync::Mutex<()>>,
     art: ArtLoader,
     events: std::sync::mpsc::Sender<Event>,
     commands: mpsc::UnboundedSender<Command>,
@@ -1895,6 +1905,7 @@ impl Worker {
             connect: Arc::default(),
             receiver_discovery: None,
             background_session: Arc::new(tokio::sync::Semaphore::new(4)),
+            rotation_lock: Arc::default(),
             http,
             friend_names: Arc::default(),
             art,
@@ -2116,6 +2127,42 @@ impl Worker {
                         };
                         let _ = events.send(Event::Autostart { request, result });
                         waker.wake();
+                    });
+                }
+                Command::Rotation { request, action } => {
+                    let Some(account) = self.api.account() else {
+                        self.emit(Event::Rotation {
+                            request,
+                            account_id: String::new(),
+                            result: Err("Sign in to use Rotation.".into()),
+                        });
+                        continue;
+                    };
+                    let account_id = account.as_str().to_owned();
+                    let api = self.api.clone();
+                    let root = self.dirs.state.clone();
+                    let lock = self.rotation_lock.clone();
+                    let mut generation = self.session.subscribe();
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    tokio::spawn(async move {
+                        let result = tokio::select! {
+                            biased;
+                            _ = generation.changed() => return,
+                            result = async {
+                                let guard = Arc::new(lock.lock_owned().await);
+                                crate::rotation::execute(&api, &root, &account_id, action, guard).await
+                            } => result,
+                        };
+                        if api.account().as_ref().map(|id| id.as_str()) == Some(account_id.as_str())
+                        {
+                            let _ = events.send(Event::Rotation {
+                                request,
+                                account_id,
+                                result: result.map(Box::new),
+                            });
+                            waker.wake();
+                        }
                     });
                 }
                 Command::OpenThemesFolder => {

@@ -366,6 +366,13 @@ pub fn populate(app: &mut App) {
     app.library.playlists = Loadable::Loaded(playlists.clone());
 
     let tracks: Vec<Track> = (0..40).map(track).collect();
+    app.rotation = crate::rotation::State::demo(
+        playlists[1].clone(),
+        Some(playlists[2].clone()),
+        tracks[..12].to_vec(),
+    );
+    app.rotation_loaded = true;
+    app.rotation_device = Some("local-demo".into());
     for (index, track) in tracks.iter().enumerate() {
         app.saved.insert(track.uri.clone(), index % 3 == 0);
     }
@@ -1076,6 +1083,36 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
     }
     for surface in show.unwrap_or("").split(',').map(str::trim) {
         match surface {
+            "rotation-paused" => {
+                app.rotation_device = Some("remote1".into());
+                if let Some(remote) = &mut app.remote {
+                    remote.state.is_playing = false;
+                    remote.state.shuffle_state = false;
+                    remote.state.repeat_state = "off".into();
+                    app.rotation.playback = Some(remote.state.clone());
+                }
+                app.open(Page::Rotation);
+            }
+            "rotation-empty" => {
+                app.rotation.items.clear();
+                app.rotation.order.clear();
+                app.rotation.current_index = 0;
+                app.open(Page::Rotation);
+            }
+            "rotation-loading" => {
+                app.rotation_busy = true;
+                app.open(Page::Rotation);
+            }
+            "rotation-recovery" => {
+                if let Some(current) = app.rotation.current() {
+                    app.rotation.operation = Some(crate::rotation::Operation {
+                        item_key: current.key.clone(),
+                        stage: crate::rotation::Stage::ArchiveUncertain,
+                    });
+                    app.rotation_error = Some("Archive result is unknown. Check the archive in Spotify before removing this song without adding it again.".into());
+                }
+                app.open(Page::Rotation);
+            }
             "presaved" => {
                 for page in app.album_pages.values_mut() {
                     if let Some(data) = &mut page.prerelease {
@@ -2259,13 +2296,33 @@ mod tests {
             assert!(app.manual_queue.is_empty());
             assert_eq!(app.queue.get().unwrap().queue, rows[2..]);
             let tree = accessible_frame(&ctx, &mut app, vec![]);
-            let recent = accessible_node(&tree, &gettext(locale, "Recent"), Role::Button);
+            let queue = accessible_node(&tree, &gettext(locale, "Queue"), Role::Button);
+            let queue_bounds = tree
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == queue)
+                .and_then(|(_, node)| node.bounds())
+                .expect("queue tab bounds");
+            // In Chinese, the sidebar sort and this tab have the same label.
+            // Target the button in the queue panel, including when tabs wrap.
+            let recent = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == Role::Button
+                        && node.label() == Some(gettext(locale, "Recent").as_ref())
+                        && node
+                            .bounds()
+                            .is_some_and(|bounds| bounds.x0 >= queue_bounds.x0)
+                })
+                .expect("recent queue tab")
+                .0;
             accessible_frame(
                 &ctx,
                 &mut app,
                 vec![accessible_action(recent, AccessibleAction::Click, None)],
             );
-            assert_eq!(app.queue_tab, QueueTab::Recents);
+            assert_eq!(app.queue_tab, QueueTab::Recents, "locale {locale:?}");
             let tree = accessible_frame(&ctx, &mut app, vec![]);
             let close = accessible_node(&tree, &gettext(locale, "Close"), Role::Button);
             accessible_frame(
@@ -2999,6 +3056,9 @@ mod tests {
         use egui::accesskit::Role;
         let (ctx, mut app) = accessible_app("library-grid-drop-highlight");
         app.settings.sidebar_grid = true;
+        // The first frame measures the sidebar header. Read the card bounds
+        // after its final layout rather than dragging to stale first-frame bounds.
+        accessible_frame(&ctx, &mut app, vec![]);
         let tree = accessible_frame(&ctx, &mut app, vec![]);
         let liked = tree
             .nodes
@@ -7585,6 +7645,7 @@ mod tests {
             Page::Artist("art0".into()),
             Page::Show("sh0".into()),
             Page::Queue,
+            Page::Rotation,
             Page::Settings,
         ];
         for page in pages {
