@@ -9340,6 +9340,7 @@ mod tests {
             cache: root.join("cache"),
         };
         let ctx = egui::Context::default();
+        ctx.enable_accesskit();
         let waker = crate::backend::Waker::default();
         waker.attach(&ctx);
         let mut app = App::new(
@@ -9361,38 +9362,52 @@ mod tests {
             frame(&ctx, &mut app);
         }
 
-        // Sweep from the top; the first slot inside the list is the one
-        // right under Liked Songs, between what were the first two
-        // unpinned playlists.
-        let mut dropped = false;
-        for step in 0..40 {
-            let pos = egui::pos2(120.0, 100.0 + step as f32 * 10.0);
-            egui::DragAndDrop::set_payload(
-                &ctx,
-                DragEntry {
-                    uri: "spotify:playlist:pl4".into(),
-                    title: "Release Radar".into(),
-                    image: None,
-                },
-            );
-            frame_events(&ctx, &mut app, vec![egui::Event::PointerMoved(pos)]);
-            frame_events(
-                &ctx,
-                &mut app,
-                vec![egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-            );
-            egui::DragAndDrop::clear_payload(&ctx);
-            if !app.settings.sidebar_order.is_empty() {
-                dropped = true;
-                break;
-            }
-        }
-        assert!(dropped, "no sweep position landed below Liked Songs");
+        // Use the rendered rows: the added navigation entry and platform
+        // fonts move this gap, so a fixed screen-coordinate sweep can miss it.
+        let tree = accessible_frame(&ctx, &mut app, vec![]);
+        let row_bounds = |label: &str| {
+            tree.nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Button
+                        && node.label() == Some(label)
+                        && node.bounds().is_some_and(|bounds| bounds.x0 < 250.0)
+                })
+                .unwrap_or_else(|| panic!("missing sidebar row {label}"))
+                .1
+                .bounds()
+                .unwrap()
+        };
+        let first = row_bounds("Discover Weekly");
+        let second = row_bounds("Late night focus");
+        let pos = egui::pos2(
+            ((first.x0 + first.x1) / 2.0) as f32,
+            ((first.y1 + second.y0) / 2.0) as f32,
+        );
+        egui::DragAndDrop::set_payload(
+            &ctx,
+            DragEntry {
+                uri: "spotify:playlist:pl4".into(),
+                title: "Release Radar".into(),
+                image: None,
+            },
+        );
+        frame_events(&ctx, &mut app, vec![egui::Event::PointerMoved(pos)]);
+        frame_events(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        egui::DragAndDrop::clear_payload(&ctx);
+        assert!(
+            !app.settings.sidebar_order.is_empty(),
+            "dropping between the rendered rows should create a custom order"
+        );
         let expected: Vec<String> = [0, 4]
             .into_iter()
             .chain((1..PLAYLISTS.len()).filter(|index| *index != 4))
