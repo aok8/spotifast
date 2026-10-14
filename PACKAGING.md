@@ -123,6 +123,25 @@ immutable workflow reference, and the gem installation pins in the release and
 CI workflows together.
 Applications need no packaging Gemfile, lockfile or Ruby wrapper.
 
+## Development packages
+
+**Branch packages** builds the checked-out source on pushes to `codex/**`,
+pull requests, and manual runs. Download its `branch-*` artifacts from the
+workflow run in GitHub Actions. Each run carries the commit being tested;
+package versions still come from `Cargo.toml`.
+
+It produces Linux amd64/arm64 portable archives, DEB, RPM and AppImage packages;
+Windows amd64/arm64 portable ZIP, setup EXE and MSI packages; and a macOS
+universal DMG. Linux packages are installed in a disposable Ubuntu 24.04
+container to check their runtime libraries and desktop integration. Windows
+binaries are checked for architecture and standalone runtime imports.
+
+Development packages use the existing native package recipes. The workflow
+has read-only repository permissions and does not publish releases, update
+Homebrew or AUR, or use signing credentials. The macOS development app is
+ad-hoc signed and unnotarized, so macOS may require manual approval to open it.
+These artifacts are previews and do not establish Spotify playback success.
+
 ## Automatic macOS notarization
 
 The macOS release job builds the app first, then selects
