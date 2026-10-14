@@ -23,6 +23,11 @@ current release.
 - **Settings and history.** Settings, window positions, recent plays, the
   last session, skins, themes and MilkDrop presets live in the config
   directory.
+- **Rotation.** Playlist choices, song metadata, saved shuffled order, the
+  submitted playback window and device identifier, cooldown expiry, and edit
+  recovery status stay in an account-scoped file in the state directory.
+  Rotation uses the existing Spotify sign-ins and sends playlist reads, archive
+  additions, source deletions and playback commands to Spotify when requested.
 - **Caches.** Downloaded audio, artwork, lyrics and library metadata live in
   the cache directory and can be deleted at any time.
 - **Log.** `spotifast.log` records errors and diagnostics. It stays on your

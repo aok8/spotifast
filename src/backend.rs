@@ -600,6 +600,10 @@ struct PlaylistCacheWrite {
 }
 
 pub enum Command {
+    Rotation {
+        request: u64,
+        action: crate::rotation::Request,
+    },
     OpenThemesFolder,
     ProxyRestored {
         lease: CredentialLease,
@@ -833,6 +837,11 @@ pub struct LyricsRequest {
 }
 
 pub enum Event {
+    Rotation {
+        request: u64,
+        account_id: String,
+        result: Result<Box<crate::rotation::State>, String>,
+    },
     ProxyRestored {
         config: ProxyConfig,
         password: Option<crate::credentials::ProxyPassword>,
@@ -1602,6 +1611,7 @@ struct Worker {
     made_for_you: Arc<crate::made_for_you::MadeForYou>,
     connect: Arc<crate::sonos::Controller>,
     background_session: Arc<tokio::sync::Semaphore>,
+    rotation_lock: Arc<tokio::sync::Mutex<()>>,
     art: ArtLoader,
     events: std::sync::mpsc::Sender<Event>,
     commands: mpsc::UnboundedSender<Command>,
@@ -1695,6 +1705,7 @@ impl Worker {
             made_for_you: Arc::new(crate::made_for_you::MadeForYou::new(http.clone())),
             connect: Arc::default(),
             background_session: Arc::new(tokio::sync::Semaphore::new(4)),
+            rotation_lock: Arc::default(),
             http,
             art,
             events,
@@ -1889,6 +1900,42 @@ impl Worker {
                 continue;
             }
             match command {
+                Command::Rotation { request, action } => {
+                    let Some(account) = self.api.account() else {
+                        self.emit(Event::Rotation {
+                            request,
+                            account_id: String::new(),
+                            result: Err("Sign in to use Rotation.".into()),
+                        });
+                        continue;
+                    };
+                    let account_id = account.as_str().to_owned();
+                    let api = self.api.clone();
+                    let root = self.dirs.state.clone();
+                    let lock = self.rotation_lock.clone();
+                    let mut generation = self.session.subscribe();
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    tokio::spawn(async move {
+                        let result = tokio::select! {
+                            biased;
+                            _ = generation.changed() => return,
+                            result = async {
+                                let guard = Arc::new(lock.lock_owned().await);
+                                crate::rotation::execute(&api, &root, &account_id, action, guard).await
+                            } => result,
+                        };
+                        if api.account().as_ref().map(|id| id.as_str()) == Some(account_id.as_str())
+                        {
+                            let _ = events.send(Event::Rotation {
+                                request,
+                                account_id,
+                                result: result.map(Box::new),
+                            });
+                            waker.wake();
+                        }
+                    });
+                }
                 Command::OpenThemesFolder => {
                     let directory = self.dirs.config.join("themes");
                     let events = self.events.clone();

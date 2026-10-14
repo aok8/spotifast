@@ -43,6 +43,7 @@ pub mod playlist_cover;
 pub mod power;
 pub mod prerelease;
 pub mod resample;
+pub mod rotation;
 pub mod session_reads;
 pub mod settings;
 pub mod single_instance;

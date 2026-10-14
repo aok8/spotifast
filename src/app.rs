@@ -410,6 +410,17 @@ pub struct App {
     /// What the window's title bar says, as last set.
     window_title: String,
 
+    /// Account-scoped Rotation workflow, separate from the ordinary queue.
+    pub rotation: crate::rotation::State,
+    pub rotation_busy: bool,
+    pub rotation_error: Option<String>,
+    pub rotation_loaded: bool,
+    pub rotation_device: Option<String>,
+    pub rotation_playback_pending: bool,
+    rotation_request: u64,
+    rotation_syncing: bool,
+    rotation_synced_at: Instant,
+    rotation_advance_after_remove: bool,
     pub library: Library,
     liked_songs: crate::liked::LikedSongs,
     liked_recheck_at: Option<Instant>,
@@ -952,6 +963,16 @@ impl App {
             queue_reorder_pending: None,
             queue_removed: None,
             window_title: String::new(),
+            rotation: crate::rotation::State::default(),
+            rotation_busy: false,
+            rotation_error: None,
+            rotation_loaded: false,
+            rotation_device: None,
+            rotation_playback_pending: false,
+            rotation_request: 0,
+            rotation_syncing: false,
+            rotation_synced_at: Instant::now(),
+            rotation_advance_after_remove: false,
             library: Library::default(),
             liked_songs: crate::liked::LikedSongs::default(),
             liked_recheck_at: None,
@@ -2023,6 +2044,50 @@ impl App {
                 continue;
             }
             match event {
+                Event::Rotation {
+                    request,
+                    account_id,
+                    result,
+                } => {
+                    if request != self.rotation_request
+                        || self.user_id() != Some(account_id.as_str())
+                    {
+                        continue;
+                    }
+                    self.rotation_busy = false;
+                    self.rotation_syncing = false;
+                    self.rotation_playback_pending = false;
+                    self.rotation_loaded = true;
+                    match result {
+                        Ok(state) => {
+                            let state = *state;
+                            self.rotation_error = state.error.clone();
+                            let removed = self.rotation_advance_after_remove
+                                && state.operation.as_ref().is_some_and(|operation| {
+                                    operation.stage == crate::rotation::Stage::Complete
+                                })
+                                && state.error.is_none();
+                            if self.rotation_advance_after_remove {
+                                self.receive_rotation_playlist_edits(&state, removed);
+                            }
+                            self.rotation = state;
+                            self.rotation_advance_after_remove = false;
+                            if removed && let Some(device_id) = self.rotation_device.clone() {
+                                if self.rotation.current().is_some() {
+                                    self.play_rotation(self.rotation.current_index);
+                                } else {
+                                    self.send_rotation(crate::rotation::Request::StopRemoved {
+                                        device_id,
+                                    });
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.rotation_error = Some(error);
+                            self.rotation_advance_after_remove = false;
+                        }
+                    }
+                }
                 Event::PlaylistCoverChecked {
                     id,
                     request,
@@ -2497,12 +2562,27 @@ impl App {
                     self.refresh_queue(true);
                 }
             }
+            Page::Rotation => self.ensure_loaded(Page::Rotation),
             Page::Settings => {}
         }
     }
 
     /// Clears account data while preserving request serials that reject late answers.
+    fn reset_rotation(&mut self) {
+        self.rotation = crate::rotation::State::default();
+        self.rotation_busy = false;
+        self.rotation_syncing = false;
+        self.rotation_synced_at = Instant::now();
+        self.rotation_error = None;
+        self.rotation_loaded = false;
+        self.rotation_device = None;
+        self.rotation_playback_pending = false;
+        self.rotation_request = self.rotation_request.wrapping_add(1);
+        self.rotation_advance_after_remove = false;
+    }
+
     fn reset_data(&mut self) {
+        self.reset_rotation();
         self.local_transfer_sequence = None;
         self.queue_start_pending = None;
         self.pending_album_queues.clear();
@@ -4546,6 +4626,14 @@ impl App {
                     self.refresh_queue(true);
                 }
             }
+            Page::Rotation => {
+                if !self.rotation_loaded && !self.rotation_busy && self.user_id().is_some() {
+                    self.send_rotation(crate::rotation::Request::Load);
+                }
+                if self.network_reachable && self.library.playlists.needs_load() {
+                    self.load_playlists();
+                }
+            }
             Page::Settings => {}
         }
     }
@@ -5802,6 +5890,7 @@ impl App {
                     let due = std::mem::take(&mut self.account_caches_due);
                     let changed = self.user_id() != Some(user.id.as_str());
                     if changed {
+                        self.reset_rotation();
                         self.rootlist = self
                             .rootlist_cache
                             .as_ref()
@@ -9431,6 +9520,201 @@ impl App {
         });
     }
 
+    /// Confirmed Rotation edits invalidate ordinary page caches too, while
+    /// preserving pages with their own optimistic writes still outstanding.
+    fn receive_rotation_playlist_edits(&mut self, state: &crate::rotation::State, removed: bool) {
+        let archived = state.operation.as_ref().is_some_and(|operation| {
+            matches!(
+                operation.stage,
+                crate::rotation::Stage::Archived
+                    | crate::rotation::Stage::Complete
+                    | crate::rotation::Stage::DeleteUncertain
+                    | crate::rotation::Stage::ArchiveUncertain
+            )
+        });
+        let affected = state
+            .source
+            .as_ref()
+            .filter(|_| removed)
+            .into_iter()
+            .chain(state.archive.as_ref().filter(|_| archived));
+        for playlist in affected {
+            let pending = self
+                .playlist_pages
+                .get(&playlist.id)
+                .is_some_and(|page| page.pending_writes > 0 || page.optimistic_snapshot.is_some());
+            if pending {
+                continue;
+            }
+            self.playlist_pages.remove(&playlist.id);
+            self.playlist_headers.remove(&playlist.id);
+            self.table_rows.remove(&Page::Playlist(playlist.id.clone()));
+            if let Some(playlists) = self.library.playlists.get_mut()
+                && let Some(entry) = playlists.iter_mut().find(|entry| entry.id == playlist.id)
+            {
+                entry.snapshot_id.clone_from(&playlist.snapshot_id);
+                entry.items_count.clone_from(&playlist.items_count);
+                entry.tracks.clone_from(&playlist.tracks);
+            }
+            if self.page() == &Page::Playlist(playlist.id.clone()) {
+                self.ensure_loaded(self.page().clone());
+            }
+        }
+        self.store_library_cache();
+    }
+
+    /// Submit a single serialized Rotation action. Network and durable writes live
+    /// on the backend runtime, and a request serial rejects old account callbacks.
+    fn send_rotation(&mut self, request: crate::rotation::Request) {
+        if self.rotation_busy {
+            return;
+        }
+        self.rotation_error = None;
+        self.rotation_syncing = false;
+        self.rotation_synced_at = Instant::now();
+        if self.offline {
+            self.demo_rotation(request);
+            return;
+        }
+        if self.user_id().is_none() {
+            self.rotation_error = Some("Sign in before using Rotation.".into());
+            return;
+        }
+        self.rotation_advance_after_remove = matches!(
+            request,
+            crate::rotation::Request::Remove { .. } | crate::rotation::Request::Retry
+        );
+        self.rotation_playback_pending = matches!(
+            request,
+            crate::rotation::Request::Play { .. } | crate::rotation::Request::Resume { .. }
+        );
+        self.rotation_request = self.rotation_request.wrapping_add(1);
+        self.rotation_busy = true;
+        self.backend.send(Command::Rotation {
+            request: self.rotation_request,
+            action: request,
+        });
+    }
+
+    /// Observe automatic transitions only inside the window Rotation submitted.
+    /// A sync never writes playlists or starts playback, and does not block controls.
+    fn sync_rotation_if_due(&mut self) {
+        let interval = if self.window_hidden {
+            Duration::from_secs(20)
+        } else {
+            Duration::from_secs(4)
+        };
+        if self.offline
+            || !self.network_reachable
+            || self.rotation_busy
+            || self.rotation_syncing
+            || self.rotation_error.is_some()
+            || self.rotation.unresolved()
+            || self.rotation_synced_at.elapsed() < interval
+            || self.rotation.queued_window.as_ref().is_none_or(|window| {
+                self.rotation_device.as_deref() != Some(window.device_id.as_str())
+            })
+        {
+            return;
+        }
+        self.rotation_request = self.rotation_request.wrapping_add(1);
+        self.rotation_synced_at = Instant::now();
+        self.rotation_syncing = true;
+        self.backend.send(Command::Rotation {
+            request: self.rotation_request,
+            action: crate::rotation::Request::Sync,
+        });
+    }
+
+    fn play_rotation(&mut self, index: usize) {
+        let Some(device_id) = self.rotation_device.clone() else {
+            self.rotation_error = Some("Choose a playback device first.".into());
+            return;
+        };
+        if self.rotation_busy || index >= self.rotation.order.len() {
+            return;
+        }
+        self.send_rotation(crate::rotation::Request::Play { index, device_id });
+        if self.rotation_playback_pending {
+            // Show the user's chosen song immediately while Spotify confirms it.
+            self.rotation.current_index = index;
+        }
+    }
+
+    /// Demo actions never touch a real account or playlist.
+    fn demo_rotation(&mut self, request: crate::rotation::Request) {
+        #[cfg(any(test, feature = "demo"))]
+        {
+            use crate::rotation::Request;
+            match request {
+                Request::Load => self.rotation_loaded = true,
+                Request::Sync => {}
+                Request::Configure { source, archive } => {
+                    if archive
+                        .as_ref()
+                        .is_some_and(|archive| archive.id == source.id)
+                    {
+                        self.rotation_error = Some("Choose a different archive playlist.".into());
+                        return;
+                    }
+                    let tracks = self
+                        .playlist_pages
+                        .get(&source.id)
+                        .map(|page| {
+                            page.items
+                                .items
+                                .iter()
+                                .filter_map(|row| match row.playable() {
+                                    Some(PlayableItem::Track(track)) => Some(track.clone()),
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.rotation =
+                        crate::rotation::State::demo(*source, archive.map(|p| *p), tracks);
+                    self.rotation_loaded = true;
+                }
+                Request::Restart | Request::ResolveReload => {
+                    if let Some(source) = self.rotation.source.clone() {
+                        self.demo_rotation(Request::Configure {
+                            source: Box::new(source),
+                            archive: self.rotation.archive.clone().map(Box::new),
+                        });
+                    }
+                }
+                Request::Select { index } | Request::Play { index, .. } => {
+                    if index < self.rotation.order.len() {
+                        self.rotation.current_index = index;
+                    }
+                }
+                Request::Finish { .. } => self.rotation.current_index = self.rotation.order.len(),
+                Request::Remove { .. } | Request::Retry => {
+                    self.rotation_error =
+                        Some("Demo playlists are read-only. No songs were removed.".into());
+                }
+                Request::Pause { .. } => {
+                    if let Some(playback) = &mut self.rotation.playback {
+                        playback.is_playing = false;
+                    }
+                }
+                Request::Resume { .. } => {
+                    if let Some(playback) = &mut self.rotation.playback {
+                        playback.is_playing = true;
+                    }
+                }
+                Request::Seek { position_ms, .. } => {
+                    if let Some(playback) = &mut self.rotation.playback {
+                        playback.progress_ms = Some(position_ms);
+                    }
+                }
+                Request::StopRemoved { .. } => {}
+            }
+        }
+        #[cfg(not(any(test, feature = "demo")))]
+        let _ = request;
+    }
+
     // ---- actions -----------------------------------------------------------------
 
     fn apply_actions(&mut self, ctx: &egui::Context) {
@@ -9486,6 +9770,14 @@ impl App {
             self.supersede_play_search();
         }
         match action {
+            Action::Rotation(request) => self.send_rotation(request),
+            Action::RotationPlay(index) => self.play_rotation(index),
+            Action::RotationSelectDevice(device) => {
+                if !self.rotation_busy {
+                    self.rotation_device = Some(device);
+                    self.rotation_error = None;
+                }
+            }
             Action::Open(page) => self.open(page),
             Action::OpenSongRadio { uri, track } => self.open_song_radio(&uri, &track),
             Action::PrepareTint(url) => {
@@ -10998,6 +11290,7 @@ impl App {
         #[cfg(feature = "milkdrop")]
         self.sync_milkdrop(ctx);
         self.apply_actions(ctx);
+        self.sync_rotation_if_due();
         self.sync_media_controls(ctx);
         self.sync_window_title(ctx);
         self.remember_geometry(ctx);
@@ -17826,6 +18119,156 @@ mod tests {
         );
         app.reveal_theme_changes = false;
         app
+    }
+
+    #[test]
+    fn rotation_rejects_old_requests_and_previous_account_answers() {
+        let mut app = test_app("rotation-stale");
+        app.user = Some(User {
+            id: "listener".into(),
+            ..Default::default()
+        });
+        app.rotation_request = 7;
+        app.rotation_busy = true;
+        for (request, account) in [(6, "listener"), (7, "another-account")] {
+            app.handle_backend_events(vec![Event::Rotation {
+                request,
+                account_id: account.into(),
+                result: Ok(Box::new(crate::rotation::State::new(account.into()))),
+            }]);
+            assert!(app.rotation_busy);
+            assert!(!app.rotation_loaded);
+        }
+        app.handle_backend_events(vec![Event::Rotation {
+            request: 7,
+            account_id: "listener".into(),
+            result: Ok(Box::new(crate::rotation::State::new("listener".into()))),
+        }]);
+        assert!(!app.rotation_busy);
+        assert!(app.rotation_loaded);
+        app.reset_rotation();
+        app.handle_backend_events(vec![Event::Rotation {
+            request: 7,
+            account_id: "listener".into(),
+            result: Ok(Box::new(crate::rotation::State::new("listener".into()))),
+        }]);
+        assert!(!app.rotation_loaded);
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn rotation_partial_removal_retains_current_song_and_never_starts_playback() {
+        let mut app = test_app("rotation-partial");
+        app.user = Some(User {
+            id: "listener".into(),
+            ..Default::default()
+        });
+        let source = Playlist {
+            id: "source".into(),
+            ..Default::default()
+        };
+        let mut state = crate::rotation::State::demo(
+            source,
+            None,
+            vec![
+                Track {
+                    uri: "spotify:track:one".into(),
+                    ..Default::default()
+                },
+                Track {
+                    uri: "spotify:track:two".into(),
+                    ..Default::default()
+                },
+            ],
+        );
+        let key = state.current().unwrap().key.clone();
+        state.operation = Some(crate::rotation::Operation {
+            item_key: key.clone(),
+            stage: crate::rotation::Stage::Archived,
+        });
+        state.error = Some("Source removal failed.".into());
+        app.rotation_busy = true;
+        app.rotation_advance_after_remove = true;
+        app.rotation_device = Some("chosen-device".into());
+        app.handle_backend_events(vec![Event::Rotation {
+            request: app.rotation_request,
+            account_id: "listener".into(),
+            result: Ok(Box::new(state)),
+        }]);
+        assert_eq!(app.rotation.current().unwrap().key, key);
+        assert!(!app.rotation_busy);
+        assert!(!app.rotation_playback_pending);
+        assert_eq!(
+            app.rotation_error.as_deref(),
+            Some("Source removal failed.")
+        );
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn rotation_edits_drop_idle_caches_but_preserve_pending_normal_edits() {
+        let mut app = test_app("rotation-cache-coherence");
+        let source = Playlist {
+            id: "source".into(),
+            snapshot_id: Some("new".into()),
+            tracks: Some(TrackCount { total: 1 }),
+            ..Default::default()
+        };
+        let archive = Playlist {
+            id: "archive".into(),
+            ..Default::default()
+        };
+        let mut state = crate::rotation::State::demo(
+            source.clone(),
+            Some(archive.clone()),
+            vec![Track {
+                uri: "spotify:track:one".into(),
+                ..Default::default()
+            }],
+        );
+        state.operation = Some(crate::rotation::Operation {
+            item_key: state.current().unwrap().key.clone(),
+            stage: crate::rotation::Stage::Archived,
+        });
+        app.playlist_pages
+            .insert("source".into(), PlaylistPage::default());
+        app.playlist_pages
+            .insert("archive".into(), PlaylistPage::default());
+        app.receive_rotation_playlist_edits(&state, false);
+        assert!(app.playlist_pages.contains_key("source"));
+        assert!(!app.playlist_pages.contains_key("archive"));
+        app.playlist_pages.get_mut("source").unwrap().pending_writes = 1;
+        app.receive_rotation_playlist_edits(&state, true);
+        assert!(app.playlist_pages.contains_key("source"));
+        app.playlist_pages.get_mut("source").unwrap().pending_writes = 0;
+        app.library.playlists = Loadable::Loaded(vec![Playlist {
+            id: "source".into(),
+            tracks: Some(TrackCount { total: 2 }),
+            ..Default::default()
+        }]);
+        app.receive_rotation_playlist_edits(&state, true);
+        assert!(!app.playlist_pages.contains_key("source"));
+        assert_eq!(app.library.playlists.get().unwrap()[0].track_total(), 1);
+        assert_eq!(
+            app.library.playlists.get().unwrap()[0]
+                .snapshot_id
+                .as_deref(),
+            Some("new")
+        );
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn rotation_requires_a_device_even_when_normal_playback_has_a_target() {
+        let mut app = test_app("rotation-explicit-device");
+        app.selected_device = Some("ordinary-device".into());
+        app.play_rotation(0);
+        assert!(!app.rotation_busy);
+        assert_eq!(
+            app.rotation_error.as_deref(),
+            Some("Choose a playback device first.")
+        );
+        app.backend.shutdown();
     }
 
     /// Demo mode is offline, but it reads cover art and its colours like

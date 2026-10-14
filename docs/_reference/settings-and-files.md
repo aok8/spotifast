@@ -22,6 +22,7 @@ Spotifast follows each platform's conventions. On Linux:
 | Legacy playback credential | `~/.local/state/spotifast/credentials/` | Removed after migration or sign-out |
 | Proxy password | System credential store | Clear the password and apply the manual proxy settings |
 | Legacy proxy password | `~/.local/state/spotifast/proxy_password` | Removed after protected migration |
+| Account-scoped Rotation state | `~/.local/state/spotifast/rotation/<encoded-account-id>.json` | Keep while a playlist edit needs recovery |
 | Last session | `~/.local/state/spotifast/session.json` | Yes |
 | Play history | `~/.local/state/spotifast/history.json` | Yes |
 | Audio cache | `~/.cache/spotifast/audio/` | Always |
@@ -46,7 +47,10 @@ Durable grants use **Secret Service on Linux**, **Keychain on macOS**, and
 `rocks.spotifast.Spotifast`. Entries are separated by application state
 location and grant type; Web grants carry their Client ID and must verify as
 the same account. Playback and receiver activation require that account too.
-Non-secret settings and session data remain readable JSON. Native credential
+Non-secret settings and session data remain readable JSON. Rotation stores playlist
+choices, track metadata, shuffled order, current position, submitted playback
+window/device, cooldown expiry and pending edit recovery in account-scoped JSON
+under the state directory; it contains no Spotify grants. Native credential
 protection reduces exposure from copying ordinary application files. It does
 not protect a usable session from arbitrary code running as the same user;
 Linux protection also depends on the desktop keyring's configuration.

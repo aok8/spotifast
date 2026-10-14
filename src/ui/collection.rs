@@ -2814,6 +2814,7 @@ mod tests {
         (0..4)
             .map(|i| {
                 let track = Track {
+                    restrictions: None,
                     id: Some(format!("t_{i}")),
                     name: titles[i].to_string(),
                     uri: format!("spotify:track:t_{i}"),

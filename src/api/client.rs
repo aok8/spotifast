@@ -82,6 +82,55 @@ fn logged_path(path: &str) -> &str {
     path.split('?').next().unwrap_or_default()
 }
 
+fn guarded_device(value: &Value) -> Result<()> {
+    if value
+        .get("is_restricted")
+        .and_then(Value::as_bool)
+        .is_none()
+        || value.get("is_active").and_then(Value::as_bool).is_none()
+    {
+        return Err(ApiError::Decode(
+            "Playback device safety flags are missing.".into(),
+        ));
+    }
+    Ok(())
+}
+fn parse_rotation_devices(value: Value) -> Result<Vec<Device>> {
+    let devices = value
+        .get("devices")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::Decode("The playback device list is missing.".into()))?;
+    for device in devices {
+        guarded_device(device)?;
+    }
+    serde_json::from_value::<DeviceList>(value)
+        .map(|list| list.devices)
+        .map_err(|_| ApiError::Decode("The playback device list is malformed.".into()))
+}
+fn parse_rotation_playback(value: Value) -> Result<PlaybackState> {
+    guarded_device(
+        value
+            .get("device")
+            .ok_or_else(|| ApiError::Decode("The playback device is missing.".into()))?,
+    )?;
+    if value.get("is_playing").and_then(Value::as_bool).is_none()
+        || value
+            .get("shuffle_state")
+            .and_then(Value::as_bool)
+            .is_none()
+        || !value
+            .get("repeat_state")
+            .and_then(Value::as_str)
+            .is_some_and(|mode| matches!(mode, "off" | "track" | "context"))
+    {
+        return Err(ApiError::Decode(
+            "Playback safety flags are missing.".into(),
+        ));
+    }
+    serde_json::from_value(value)
+        .map_err(|_| ApiError::Decode("Playback state is malformed.".into()))
+}
+
 /// Where bearer tokens come from.
 ///
 /// The Web API is driven by a registered application's PKCE grant, refreshed
@@ -713,6 +762,22 @@ impl ApiClient {
             &[("additional_types", "track,episode".to_string())],
         )
         .await
+    }
+
+    /// Rotation must establish device restrictions and playback modes explicitly.
+    /// Ordinary views retain their tolerant metadata reads.
+    pub async fn rotation_devices(&self) -> Result<Vec<Device>> {
+        parse_rotation_devices(self.get::<Value>("/me/player/devices", &[]).await?)
+    }
+
+    pub async fn rotation_playback_state(&self) -> Result<Option<PlaybackState>> {
+        self.get_optional::<Value>(
+            "/me/player",
+            &[("additional_types", "track,episode".into())],
+        )
+        .await?
+        .map(parse_rotation_playback)
+        .transpose()
     }
 
     pub async fn queue(&self) -> Result<Queue> {
@@ -1960,5 +2025,18 @@ mod tests {
         shared.extend_cooldown(Duration::from_secs(10)).await;
         assert!(*shared.cooldown_until.lock().await > Instant::now());
         assert!(*personal.cooldown_until.lock().await <= Instant::now());
+    }
+    #[test]
+    fn rotation_reads_reject_missing_device_and_playback_safety_flags() {
+        assert!(parse_rotation_devices(json!({"devices":[{"id":"chosen"}]})).is_err());
+        assert!(parse_rotation_devices(json!({"devices":[null]})).is_err());
+        assert!(parse_rotation_playback(json!({"device":{"id":"chosen","is_active":true,"is_restricted":false},"is_playing":true,"repeat_state":"off"})).is_err());
+        assert!(
+            parse_rotation_devices(
+                json!({"devices":[{"id":"chosen","is_active":true,"is_restricted":false}]})
+            )
+            .is_ok()
+        );
+        assert!(parse_rotation_playback(json!({"device":{"id":"chosen","is_active":true,"is_restricted":false},"is_playing":true,"shuffle_state":false,"repeat_state":"off"})).is_ok());
     }
 }

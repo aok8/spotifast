@@ -295,6 +295,9 @@ impl Album {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Track {
+    /// Spotify restrictions remain part of raw metadata for safe playlist editing.
+    #[serde(default)]
+    pub restrictions: Option<serde_json::Value>,
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]

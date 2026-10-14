@@ -25,8 +25,9 @@ framework behind a family of native desktop apps. It plays music through
 [librespot](https://github.com/librespot-org/librespot), typically uses
 100–250 MB of RAM, starts in well under a second, and has no browser engine.
 
-The interface includes complete
+The existing browsing and playback interface includes complete
 [translations for all supported languages](docs/_reference/translating.md#languages-and-coverage).
+The Rotation preview currently uses English.
 
 **Playback needs Spotify Premium.** Free accounts can browse and search, but
 cannot play music through Spotifast.
@@ -47,6 +48,7 @@ https://github.com/user-attachments/assets/a5f669ce-b3b7-4f8e-9933-976a78876c7e
 | Feature | What you can do |
 |---|---|
 | **Library and search** | Browse playlists, Liked Songs, albums, artists, and podcasts. Search the catalogue and edit playlists you own. |
+| **Rotation** | Work through a saved shuffled playlist, with an optional history playlist and guarded Remove and skip. |
 | **Spotify Connect** | Play on this computer or control playback on your other devices, including Google Cast speakers and groups. |
 | **Themes** | Choose light, dark, system appearance, or custom colours. On Omarchy, follow your desktop theme. |
 | **Desktop controls** | Use keyboard shortcuts and media keys. Keep music playing from the tray when supported by your desktop and settings. |

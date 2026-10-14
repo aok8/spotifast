@@ -4,6 +4,45 @@ description: Independent Spotify grants, what is stored, and how API traffic is 
 nav_order: 1
 ---
 
+## Rotation playlist editing
+
+Rotation uses the existing account-verified Web API gateway for playlist reads,
+archive additions and source deletions. It has no separate OAuth application,
+token store or server. Playlist access follows the same shared/personal grant
+routing as the rest of Spotifast.
+
+Rotation reads every source page and verifies the playlist snapshot before
+saving its order or attempting removal. It checks raw URI counts and positions
+before any archive add and checks the source again before deletion. Recovery
+stages are atomically saved on a background worker before writes whose results
+could be uncertain. An ambiguous archive add is never automatically repeated;
+a confirmed archive followed by a rejected delete can retry deletion alone.
+Spotify has no transaction across two playlists. An external edit between the
+final check and deletion remains a race; the submitted snapshot limits stale
+edits but cannot prove URI uniqueness at the instant of deletion.
+
+Playback uses an explicit unrestricted device and a Web API Play request with
+up to 20 ordered URIs on a verified active device, or one provisional URI when
+activity or modes are not established. When the selected device is already
+active, Rotation turns off Shuffle
+and Repeat if needed and checks their state. It observes the selected device,
+track and modes before confirming playback. Pause and seek require that same
+track/device match. A timeout or accepted command with no matching observation
+remains visible as an error. Next and Previous reseed with Play rather than
+issuing a native queue skip. Rotation does not read Spotify's queue or require
+an additional grant for the queue endpoint.
+
+While a submitted window exists for the explicitly chosen device, Rotation
+checks player state across app pages every four seconds in a visible window,
+or every twenty seconds while hidden. A matching explicit device, Shuffle and
+Repeat off, and a unique URI
+inside that window can advance the saved index; an earlier observation cannot
+move it backward. Mismatches stop this synchronization until a deliberate user
+action. It does not refill the window automatically. Playback timeouts,
+ambiguous transport/read errors and Spotify service failures save a ten-second
+cooldown; rate limits also follow the existing gateway. A terminal removal
+pauses only the selected device still playing the just-removed URI.
+
 ## Independent grants, once each
 
 Spotifast uses separate credentials for Web API access, a personal app, and
