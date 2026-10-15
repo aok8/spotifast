@@ -24,6 +24,8 @@ struct Removal {
     archive: Option<String>,
     archive_id: Option<String>,
     without_archive: bool,
+    require_active: bool,
+    device_id: Option<String>,
 }
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
@@ -40,6 +42,25 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     configuration(app, ui);
     ui.add_space(18.0);
     output(app, ui);
+    ui.add_space(12.0);
+    if app.rotation_active {
+        if theme::pill_button(ui, &palette, "Turn off", false).clicked() {
+            app.actions.push(Action::RotationTurnOff);
+        }
+    } else {
+        ui.add_enabled_ui(
+            !app.rotation_busy
+                && !app.rotation_playback_pending
+                && !app.rotation.unresolved()
+                && app.rotation.current().is_some()
+                && app.rotation_device.is_some(),
+            |ui| {
+                if theme::pill_button(ui, &palette, "Turn on", true).clicked() {
+                    app.actions.push(Action::RotationTurnOn);
+                }
+            },
+        );
+    }
     if app.rotation_busy {
         ui.horizontal(|ui| {
             theme::spinner(ui, 16.0, palette.accent);
@@ -75,106 +96,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         .take(20)
         .cloned()
         .collect();
-    let locked = app.rotation_busy || app.rotation_playback_pending || app.rotation.unresolved();
     if let Some(current) = app.rotation.current().cloned() {
-        let observed = app
-            .rotation
-            .playback
-            .as_ref()
-            .or_else(|| app.remote.as_ref().map(|remote| &remote.state))
-            .filter(|state| {
-                state.device.as_ref().and_then(|device| device.id.as_ref())
-                    == app.rotation_device.as_ref()
-                    && state.item.as_ref().map(|item| item.uri())
-                        == Some(current.track.uri.as_str())
-            });
-        let paused =
-            app.rotation_device.is_some() && observed.is_some_and(|state| !state.is_playing);
-        let observed_position = observed.and_then(|state| state.progress_ms).unwrap_or(0);
         theme::text(ui, "Current song", theme::bold(18.0), palette.text);
         ui.add_space(8.0);
         song(ui, &palette, &current.track, true);
-        ui.add_space(10.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.add_enabled_ui(!locked, |ui| {
-                ui.add_enabled_ui(app.rotation_device.is_some(), |ui| {
-                    if theme::pill_button(
-                        ui,
-                        &palette,
-                        if paused { "Resume" } else { "Play" },
-                        true,
-                    )
-                    .clicked()
-                    {
-                        if paused && let Some(device_id) = app.rotation_device.clone() {
-                            app.actions
-                                .push(Action::Rotation(Request::Resume { device_id }));
-                        } else {
-                            app.actions.push(Action::RotationPlay(index));
-                        }
-                    }
-                });
-                if let Some(device_id) = &app.rotation_device
-                    && theme::pill_button(ui, &palette, "Pause", false).clicked()
-                {
-                    app.actions.push(Action::Rotation(Request::Pause {
-                        device_id: device_id.clone(),
-                    }));
-                }
-                ui.add_enabled_ui(index > 0, |ui| {
-                    if theme::pill_button(ui, &palette, "Previous", false).clicked() {
-                        navigate(app, index - 1);
-                    }
-                });
-                if theme::pill_button(ui, &palette, "Next", false).clicked() {
-                    if index + 1 < total {
-                        navigate(app, index + 1);
-                    } else {
-                        app.actions.push(Action::Rotation(Request::Finish {
-                            device_id: app.rotation_device.clone(),
-                        }));
-                    }
-                }
-                if theme::pill_button(ui, &palette, "Remove and skip", false).clicked() {
-                    ui.ctx().data_mut(|data| {
-                        data.insert_temp(
-                            Id::new("rotation-removal"),
-                            Removal {
-                                key: current.key.clone(),
-                                name: current.track.name.clone(),
-                                archive: app.rotation.archive.as_ref().map(|p| p.name.clone()),
-                                archive_id: app.rotation.archive.as_ref().map(|p| p.id.clone()),
-                                without_archive: false,
-                            },
-                        )
-                    });
-                }
-            });
-        });
-        if let Some(device_id) = &app.rotation_device {
-            let mut position = observed_position;
-            let time = format!(
-                "{} / {}",
-                crate::util::format_duration_ms(position),
-                crate::util::format_duration_ms(current.track.duration_ms)
-            );
-            ui.add_enabled_ui(!locked, |ui| {
-                let response = ui.add(
-                    egui::Slider::new(&mut position, 0..=current.track.duration_ms)
-                        .show_value(false)
-                        .text(time),
-                );
-                if response.drag_stopped() || (response.changed() && !response.dragged()) {
-                    app.actions.push(Action::Rotation(Request::Seek {
-                        device_id: device_id.clone(),
-                        position_ms: position,
-                    }));
-                }
-            });
-        }
         paragraph(
             ui,
-            "Next and Previous keep every song in your playlists.",
+            if app.rotation_active {
+                "Rotation is on. Use the player’s X to remove and skip. Previous and Next keep songs in your playlists."
+            } else {
+                "Turn on Rotation to play this order and edit with the player’s X button."
+            },
             theme::regular(12.0),
             palette.secondary,
         );
@@ -214,20 +146,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             palette.secondary,
         );
     }
-    confirmation(app, ui.ctx());
 }
 
 fn paragraph(ui: &mut egui::Ui, text: impl Into<String>, font: egui::FontId, color: egui::Color32) {
     ui.add(egui::Label::new(RichText::new(text.into()).font(font).color(color)).wrap());
-}
-
-fn navigate(app: &mut App, index: usize) {
-    if app.rotation_device.is_some() {
-        app.actions.push(Action::RotationPlay(index));
-    } else {
-        app.actions
-            .push(Action::Rotation(Request::Select { index }));
-    }
 }
 
 fn configuration(app: &mut App, ui: &mut egui::Ui) {
@@ -517,6 +439,8 @@ fn recovery(app: &mut App, ui: &mut egui::Ui) {
                         archive: None,
                         archive_id: app.rotation.archive.as_ref().map(|p| p.id.clone()),
                         without_archive: true,
+                        require_active: false,
+                        device_id: None,
                     },
                 )
             });
@@ -550,7 +474,40 @@ fn recovery(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
-fn confirmation(app: &mut App, ctx: &egui::Context) {
+/// Snapshot the occurrence and archive before showing a destructive edit.
+/// The footer can open this on any page; drawing still only emits actions.
+pub(crate) fn request_removal(app: &App, ctx: &egui::Context) {
+    if !app.rotation_can_remove() {
+        return;
+    }
+    let Some(current) = app.rotation.current() else {
+        return;
+    };
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            Id::new("rotation-removal"),
+            Removal {
+                key: current.key.clone(),
+                name: current.track.name.clone(),
+                archive: app
+                    .rotation
+                    .archive
+                    .as_ref()
+                    .map(|playlist| playlist.name.clone()),
+                archive_id: app
+                    .rotation
+                    .archive
+                    .as_ref()
+                    .map(|playlist| playlist.id.clone()),
+                without_archive: false,
+                require_active: true,
+                device_id: app.rotation_device.clone(),
+            },
+        )
+    });
+}
+
+pub(crate) fn confirmation(app: &mut App, ctx: &egui::Context) {
     let id = Id::new("rotation-removal");
     let Some(removal) = ctx.data(|data| data.get_temp::<Removal>(id)) else {
         return;
@@ -560,6 +517,8 @@ fn confirmation(app: &mut App, ctx: &egui::Context) {
         .current()
         .is_none_or(|item| item.key != removal.key)
         || app.rotation.archive.as_ref().map(|p| &p.id) != removal.archive_id.as_ref()
+        || (removal.require_active
+            && (!app.rotation_active || app.rotation_device != removal.device_id))
     {
         ctx.data_mut(|data| data.remove::<Removal>(id));
         return;
@@ -568,17 +527,60 @@ fn confirmation(app: &mut App, ctx: &egui::Context) {
     let mut close = false;
     let response = egui::Modal::new(id).show(ctx, |ui| {
         ui.set_max_width(400.0);
-        theme::text(ui, "Remove and skip?", theme::bold(20.0), palette.text);
+        let active = app.rotation_active;
+        theme::text(
+            ui,
+            if active {
+                "Remove and skip?"
+            } else {
+                "Remove song?"
+            },
+            theme::bold(20.0),
+            palette.text,
+        );
         ui.add_space(10.0);
-        let text = if let Some(archive) = &removal.archive { format!("Add “{}” to “{}”, then remove it from the source playlist. The next song starts only after removal succeeds.", removal.name, archive) } else { format!("Remove “{}” from the source playlist without adding it to history. The next song starts only after removal succeeds.", removal.name) };
+        let playback = if active {
+            "The next song starts only after removal succeeds."
+        } else {
+            "Your current playback continues."
+        };
+        let text = if let Some(archive) = &removal.archive {
+            format!(
+                "Add “{}” to “{}”, then remove it from the source playlist. {playback}",
+                removal.name, archive
+            )
+        } else {
+            format!(
+                "Remove “{}” from the source playlist without adding it to history. {playback}",
+                removal.name
+            )
+        };
         ui.add(egui::Label::new(text).wrap());
         ui.add_space(14.0);
         ui.horizontal_wrapped(|ui| {
-            if theme::pill_button(ui, &palette, "Remove and skip", true).clicked() {
-                app.actions.push(Action::Rotation(Request::Remove { item_key: removal.key.clone(), without_archive: removal.without_archive }));
+            ui.add_enabled_ui(!removal.require_active || app.rotation_can_remove(), |ui| {
+                if theme::pill_button(
+                    ui,
+                    &palette,
+                    if active {
+                        "Remove and skip"
+                    } else {
+                        "Remove from source"
+                    },
+                    true,
+                )
+                .clicked()
+                {
+                    app.actions.push(Action::Rotation(Request::Remove {
+                        item_key: removal.key.clone(),
+                        without_archive: removal.without_archive,
+                    }));
+                    close = true;
+                }
+            });
+            if theme::pill_button(ui, &palette, "Cancel", false).clicked() {
                 close = true;
             }
-            if theme::pill_button(ui, &palette, "Cancel", false).clicked() { close = true; }
         });
     });
     if close || response.should_close() {
@@ -678,6 +680,92 @@ mod tests {
     }
 
     #[test]
+    fn rotation_has_a_mode_button_without_duplicate_transport() {
+        let mut app = app();
+        for active in [false, true] {
+            app.rotation_active = active;
+            let ctx = egui::Context::default();
+            theme::install(&ctx);
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| show(&mut app, ui));
+                },
+            );
+            output.textures_delta.clear();
+            let labels: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        Some(text.galley.text())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert!(labels.contains(&if active { "Turn off" } else { "Turn on" }));
+            for duplicate in [
+                "Previous",
+                "Next",
+                "Play",
+                "Pause",
+                "Resume",
+                "Remove and skip",
+            ] {
+                assert!(
+                    !labels.contains(&duplicate),
+                    "duplicate Rotation transport: {duplicate}"
+                );
+            }
+            assert!(app.actions.is_empty());
+        }
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn footer_confirmation_closes_when_rotation_mode_or_target_changes() {
+        use crate::api::models::{Device, PlayableItem, PlaybackState};
+        let mut app = app();
+        app.rotation_active = true;
+        app.rotation_device = Some("rotation-device".into());
+        app.rotation.playback = Some(PlaybackState {
+            device: Some(Device {
+                id: app.rotation_device.clone(),
+                is_active: true,
+                ..Default::default()
+            }),
+            repeat_state: "off".into(),
+            item: Some(PlayableItem::Track(
+                app.rotation.current().unwrap().track.clone(),
+            )),
+            ..Default::default()
+        });
+        let ctx = egui::Context::default();
+        let id = Id::new("rotation-removal");
+        request_removal(&app, &ctx);
+        assert!(ctx.data(|data| data.get_temp::<Removal>(id)).is_some());
+        app.rotation_active = false;
+        confirmation(&mut app, &ctx);
+        assert!(ctx.data(|data| data.get_temp::<Removal>(id)).is_none());
+        assert!(app.actions.is_empty());
+        app.rotation_active = true;
+        request_removal(&app, &ctx);
+        assert!(ctx.data(|data| data.get_temp::<Removal>(id)).is_some());
+        app.rotation_device = Some("different-device".into());
+        confirmation(&mut app, &ctx);
+        assert!(ctx.data(|data| data.get_temp::<Removal>(id)).is_none());
+        assert!(app.actions.is_empty());
+        app.backend.shutdown();
+    }
+
+    #[test]
     fn stale_removal_confirmation_cannot_target_a_changed_archive() {
         let mut app = app();
         app.rotation.archive = Some(Playlist {
@@ -695,6 +783,8 @@ mod tests {
                     archive: Some("Old archive".into()),
                     archive_id: Some("old-archive".into()),
                     without_archive: false,
+                    require_active: false,
+                    device_id: None,
                 },
             )
         });

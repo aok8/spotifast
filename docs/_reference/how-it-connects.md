@@ -22,26 +22,42 @@ final check and deletion remains a race; the submitted snapshot limits stale
 edits but cannot prove URI uniqueness at the instant of deletion.
 
 Playback uses an explicit unrestricted device and a Web API Play request with
-up to 20 ordered URIs on a verified active device, or one provisional URI when
+up to 20 ordered URIs on a verified active device, stopping before the first
+repeated URI, or one provisional URI when
 activity or modes are not established. When the selected device is already
-active, Rotation turns off Shuffle
-and Repeat if needed and checks their state. It observes the selected device,
+active, Rotation turns off Shuffle and Repeat if needed and checks their state. It observes the selected device,
 track and modes before confirming playback. Pause and seek require that same
 track/device match. A timeout or accepted command with no matching observation
 remains visible as an error. Next and Previous reseed with Play rather than
 issuing a native queue skip. Rotation does not read Spotify's queue or require
 an additional grant for the queue endpoint.
 
-While a submitted window exists for the explicitly chosen device, Rotation
-checks player state across app pages every four seconds in a visible window,
+While Rotation mode is on and a submitted window exists for the explicitly
+chosen device, Rotation checks player state across app pages every four seconds
+in a visible window,
 or every twenty seconds while hidden. A matching explicit device, Shuffle and
-Repeat off, and a unique URI
-inside that window can advance the saved index; an earlier observation cannot
-move it backward. Mismatches stop this synchronization until a deliberate user
-action. It does not refill the window automatically. Playback timeouts,
+Repeat off, and a unique URI inside that window can advance the saved index;
+an earlier observation cannot
+move it backward. Observed device, mode or outside-order mismatches exit
+Rotation mode; Turn on is the explicit recovery action. It does not refill the window automatically. Playback timeouts,
 ambiguous transport/read errors and Spotify service failures save a ten-second
 cooldown; rate limits also follow the existing gateway. A terminal removal
 pauses only the selected device still playing the just-removed URI.
+
+Rotation is enabled explicitly with **Turn on**. The app's normal transport
+controls then route to the Rotation state machine, and the player bar's shuffle
+control becomes the guarded **X** removal action, with an archive-aware
+confirmation bound to the current occurrence, playlist choices, device and mode.
+An ordinary song or context
+start exits the mode before submitting playback. It cancels pending Rotation
+transport work and rejects late transport callbacks so they cannot reclaim the
+player. Already submitted playlist edits retain their durable recovery stages
+and still update ordinary playlist caches, but their completion does not start
+a Rotation song while the mode is off. Turn off does not pause existing audio.
+The active-mode flag is not persisted: relaunch starts with Rotation off while
+keeping its saved order and recovery information. Submitted windows contain
+unique URIs so observations never guess a duplicate occurrence; explicit Next
+can cross a shorter window boundary without dropping copies from the saved order.
 
 ## Independent grants, once each
 

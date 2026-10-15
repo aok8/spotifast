@@ -472,13 +472,17 @@ pub struct App {
     /// Account-scoped Rotation workflow, separate from the ordinary queue.
     pub rotation: crate::rotation::State,
     pub rotation_busy: bool,
+    /// Session-only ownership of the normal transport controls.
+    pub rotation_active: bool,
     pub rotation_error: Option<String>,
     pub rotation_loaded: bool,
     pub rotation_device: Option<String>,
     pub rotation_playback_pending: bool,
     rotation_request: u64,
     rotation_syncing: bool,
+    rotation_transport_pending: bool,
     rotation_synced_at: Instant,
+    rotation_playback_received_at: Instant,
     rotation_advance_after_remove: bool,
     pub library: Library,
     liked_songs: crate::liked::LikedSongs,
@@ -1123,13 +1127,16 @@ impl App {
             window_title: String::new(),
             rotation: crate::rotation::State::default(),
             rotation_busy: false,
+            rotation_active: false,
             rotation_error: None,
             rotation_loaded: false,
             rotation_device: None,
             rotation_playback_pending: false,
             rotation_request: 0,
             rotation_syncing: false,
+            rotation_transport_pending: false,
             rotation_synced_at: Instant::now(),
+            rotation_playback_received_at: Instant::now(),
             rotation_advance_after_remove: false,
             library: Library::default(),
             liked_songs: crate::liked::LikedSongs::default(),
@@ -1660,6 +1667,15 @@ impl App {
 
     /// Where playback commands go: this computer's player or a remote device.
     pub fn target(&self) -> Target {
+        if self.rotation_active
+            && let Some(device_id) = &self.rotation_device
+        {
+            return if self.local_device_id.as_ref() == Some(device_id) {
+                Target::Local
+            } else {
+                Target::Remote(Some(device_id.clone()))
+            };
+        }
         if self.local_ready && self.local.is_active() {
             return Target::Local;
         }
@@ -1900,16 +1916,76 @@ impl App {
         if let Some(now) = &self.frame_now {
             return Some(now.clone());
         }
-        self.requested_track_preview()
+        self.rotation_now_playing()
+            .or_else(|| self.requested_track_preview())
             .or_else(|| self.now_playing_live())
             .or_else(|| self.resume_preview())
     }
 
     fn refresh_frame_now(&mut self) {
         self.frame_now = self
-            .requested_track_preview()
+            .rotation_now_playing()
+            .or_else(|| self.requested_track_preview())
             .or_else(|| self.now_playing_live())
             .or_else(|| self.resume_preview());
+    }
+
+    fn rotation_now_playing(&self) -> Option<NowPlaying> {
+        if !self.rotation_active {
+            return None;
+        }
+        let track = &self.rotation.current()?.track;
+        let live = self.rotation.playback.as_ref().filter(|live| {
+            live.item
+                .as_ref()
+                .is_some_and(|item| item.uri() == track.uri)
+        });
+        let device = live.and_then(|live| live.device.as_ref());
+        let playing = self
+            .optimistic_playing
+            .filter(|(_, at)| at.elapsed() < PLAYBACK_HOLD)
+            .map(|(playing, _)| playing)
+            .unwrap_or_else(|| {
+                live.is_some_and(|live| live.is_playing) || self.rotation_playback_pending
+            });
+        let position = live.and_then(|live| live.progress_ms).unwrap_or(0);
+        let position = if playing && !self.rotation_playback_pending {
+            position.saturating_add(self.rotation_playback_received_at.elapsed().as_millis() as u32)
+        } else {
+            position
+        };
+        Some(NowPlaying {
+            local: self.rotation_device == self.local_device_id,
+            device_name: device.map(|device| device.name.clone()),
+            device_kind: device.map(|device| device.kind.clone()),
+            uri: track.uri.clone(),
+            id: track.id.clone(),
+            title: track.name.clone(),
+            subtitle: track.artist_names(),
+            artists: track.artists.clone(),
+            album_name: track
+                .album
+                .as_ref()
+                .map(|album| album.name.clone())
+                .unwrap_or_default(),
+            album_id: track.album.as_ref().map(|album| album.id.clone()),
+            show_id: None,
+            art_url: track.image(640).map(str::to_owned),
+            art_small: track.image(64).map(str::to_owned),
+            duration_ms: track.duration_ms,
+            position_ms: position.min(track.duration_ms),
+            playing,
+            loading: self.rotation_playback_pending,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            volume_percent: device
+                .and_then(|device| device.volume_percent)
+                .unwrap_or(50),
+            can_control: true,
+            can_set_volume: device.is_some_and(|device| device.supports_volume != Some(false)),
+            is_episode: false,
+            resuming: false,
+        })
     }
 
     /// Keep the player bar on the same requested song as the playlist marker
@@ -2451,6 +2527,9 @@ impl App {
                         continue;
                     }
                     self.rotation_busy = false;
+                    self.rotation_transport_pending = false;
+                    self.rotation_synced_at = Instant::now();
+                    self.rotation_playback_received_at = Instant::now();
                     self.rotation_syncing = false;
                     self.rotation_playback_pending = false;
                     self.rotation_loaded = true;
@@ -2468,7 +2547,31 @@ impl App {
                             }
                             self.rotation = state;
                             self.rotation_advance_after_remove = false;
-                            if removed && let Some(device_id) = self.rotation_device.clone() {
+                            let playback_drifted = self.rotation_active
+                                && self.rotation.playback.as_ref().is_some_and(|live| {
+                                    live.device.as_ref().is_none_or(|device| {
+                                        device.id.as_ref() != self.rotation_device.as_ref()
+                                            || !device.is_active
+                                            || device.is_restricted
+                                    }) || live.shuffle_state
+                                        || live.repeat_state != "off"
+                                        || (!removed
+                                            && live.item.as_ref().is_some_and(|item| {
+                                                self.rotation.current().is_none_or(|entry| {
+                                                    entry.track.uri != item.uri()
+                                                })
+                                            }))
+                                });
+                            if self.rotation_error.is_some()
+                                || (self.rotation.current().is_none() && !removed)
+                                || playback_drifted
+                            {
+                                self.leave_rotation_mode();
+                            }
+                            if removed
+                                && self.rotation_active
+                                && let Some(device_id) = self.rotation_device.clone()
+                            {
                                 if self.rotation.current().is_some() {
                                     self.play_rotation(self.rotation.current_index);
                                 } else {
@@ -2479,6 +2582,7 @@ impl App {
                             }
                         }
                         Err(error) => {
+                            self.leave_rotation_mode();
                             self.rotation_error = Some(error);
                             self.rotation_advance_after_remove = false;
                         }
@@ -3030,10 +3134,13 @@ impl App {
 
     /// Clears account data while preserving request serials that reject late answers.
     fn reset_rotation(&mut self) {
+        self.leave_rotation_mode();
         self.rotation = crate::rotation::State::default();
         self.rotation_busy = false;
         self.rotation_syncing = false;
+        self.rotation_transport_pending = false;
         self.rotation_synced_at = Instant::now();
+        self.rotation_playback_received_at = Instant::now();
         self.rotation_error = None;
         self.rotation_loaded = false;
         self.rotation_device = None;
@@ -5838,6 +5945,7 @@ impl App {
     /// rows as a fresh list instead used to take seconds, threw the
     /// context away, and left Spotify's copy of the queue to reappear.
     fn play_queue_item(&mut self, index: usize, uri: String) {
+        self.leave_rotation_mode();
         if self.resume_only() {
             // Nothing is playing anywhere, so there is no live queue to
             // consume: play the shown rows as a plain list.
@@ -8821,6 +8929,7 @@ impl App {
     /// in one ordered exchange: two independent requests race, and shuffle
     /// sometimes lost.
     fn play_request(&mut self, request: PlayRequest, shuffle_first: bool) {
+        self.leave_rotation_mode();
         // Whatever starts now outranks a play-search still in flight.
         self.supersede_play_search();
         // A play from a row names its row again after this.
@@ -9371,6 +9480,17 @@ impl App {
     }
 
     fn seek(&mut self, position_ms: u32) {
+        if self.rotation_active {
+            if self.rotation_transport_ready()
+                && let Some(device_id) = self.rotation_device.clone()
+            {
+                self.send_rotation(crate::rotation::Request::Seek {
+                    device_id,
+                    position_ms,
+                });
+            }
+            return;
+        }
         // Dragging the bar under the remembered song moves the point a press
         // of play will resume from; there is no stream to seek yet.
         if self.now_playing_live().is_none() && self.resume_track.is_some() {
@@ -10503,12 +10623,14 @@ impl App {
         self.rotation_synced_at = Instant::now();
         if self.offline {
             self.demo_rotation(request);
+            self.rotation_playback_received_at = Instant::now();
             return;
         }
         if self.user_id().is_none() {
             self.rotation_error = Some("Sign in before using Rotation.".into());
             return;
         }
+        self.rotation_transport_pending = request.is_transport();
         self.rotation_advance_after_remove = matches!(
             request,
             crate::rotation::Request::Remove { .. } | crate::rotation::Request::Retry
@@ -10535,6 +10657,7 @@ impl App {
         };
         if self.offline
             || !self.network_reachable
+            || !self.rotation_active
             || self.rotation_busy
             || self.rotation_syncing
             || self.rotation_error.is_some()
@@ -10549,6 +10672,7 @@ impl App {
         self.rotation_request = self.rotation_request.wrapping_add(1);
         self.rotation_synced_at = Instant::now();
         self.rotation_syncing = true;
+        self.rotation_transport_pending = true;
         self.backend.send(Command::Rotation {
             request: self.rotation_request,
             action: crate::rotation::Request::Sync,
@@ -10560,13 +10684,133 @@ impl App {
             self.rotation_error = Some("Choose a playback device first.".into());
             return;
         };
-        if self.rotation_busy || index >= self.rotation.order.len() {
+        if self.rotation_busy || self.rotation.unresolved() || index >= self.rotation.order.len() {
             return;
         }
+        if !self.offline && self.user_id().is_none() {
+            self.rotation_error = Some("Sign in before using Rotation.".into());
+            return;
+        }
+        self.supersede_play_search();
+        self.rotation_active = true;
+        self.selected_device =
+            (self.local_device_id.as_ref() != Some(&device_id)).then(|| device_id.clone());
+        self.queued_play = None;
         self.send_rotation(crate::rotation::Request::Play { index, device_id });
         if self.rotation_playback_pending {
             // Show the user's chosen song immediately while Spotify confirms it.
             self.rotation.current_index = index;
+            if let Some(entry) = self.rotation.current() {
+                let track = entry.track.clone();
+                let uri = track.uri.clone();
+                if let Some(id) = track
+                    .id
+                    .clone()
+                    .or_else(|| util::uri_id(&uri).map(str::to_owned))
+                {
+                    self.track_cache.insert(id, track);
+                }
+                self.expect_track(uri, 0);
+                self.optimistic_playing = Some((true, Instant::now()));
+            }
+        }
+    }
+
+    /// Leaving never cancels an already submitted playlist edit. Its answer must
+    /// still invalidate normal playlist caches, but cannot reclaim playback.
+    fn leave_rotation_mode(&mut self) {
+        if self.rotation_active {
+            self.rotation_active = false;
+            self.intent_track = None;
+            self.optimistic_playing = None;
+            if self.rotation_transport_pending {
+                self.rotation_request = self.rotation_request.wrapping_add(1);
+                self.rotation_busy = false;
+                self.rotation_syncing = false;
+                self.rotation_playback_pending = false;
+                self.rotation_transport_pending = false;
+            }
+            self.backend.send(Command::RotationExit);
+        }
+    }
+
+    pub fn rotation_transport_ready(&self) -> bool {
+        self.rotation_active
+            && !self.rotation_busy
+            && !self.rotation.unresolved()
+            && self.rotation_error.is_none()
+            && self.rotation_device.is_some()
+            && self.rotation.current().is_some()
+    }
+
+    pub fn rotation_can_remove(&self) -> bool {
+        self.rotation_transport_ready()
+            && self.rotation.playback.as_ref().is_some_and(|live| {
+                live.device.as_ref().is_some_and(|device| {
+                    device.id.as_ref() == self.rotation_device.as_ref()
+                        && device.is_active
+                        && !device.is_restricted
+                }) && !live.shuffle_state
+                    && live.repeat_state == "off"
+                    && live.item.as_ref().is_some_and(|item| {
+                        self.rotation
+                            .current()
+                            .is_some_and(|entry| entry.track.uri == item.uri())
+                    })
+            })
+    }
+
+    fn rotation_toggle_play(&mut self) {
+        if !self.rotation_transport_ready() {
+            return;
+        }
+        let Some(device_id) = self.rotation_device.clone() else {
+            return;
+        };
+        let playing = self
+            .rotation
+            .playback
+            .as_ref()
+            .map(|live| live.is_playing)
+            .or_else(|| self.now_playing().map(|now| now.playing))
+            .unwrap_or(false);
+        self.send_rotation(if playing {
+            crate::rotation::Request::Pause { device_id }
+        } else {
+            crate::rotation::Request::Resume { device_id }
+        });
+        self.optimistic_playing = Some((!playing, Instant::now()));
+    }
+
+    fn rotation_step(&mut self, forward: bool) {
+        if !self.rotation_transport_ready() {
+            return;
+        }
+        let position = self
+            .now_playing()
+            .map(|now| now.position_ms)
+            .or_else(|| {
+                self.rotation
+                    .playback
+                    .as_ref()
+                    .and_then(|live| live.progress_ms)
+            })
+            .unwrap_or(0);
+        if !forward && position > RESTART_BEFORE_PREVIOUS {
+            self.seek(0);
+            return;
+        }
+        let index = if forward {
+            self.rotation.current_index.saturating_add(1)
+        } else {
+            self.rotation.current_index.saturating_sub(1)
+        };
+        if index < self.rotation.order.len() {
+            self.play_rotation(index);
+        } else if let Some(device_id) = self.rotation_device.clone() {
+            self.send_rotation(crate::rotation::Request::Finish {
+                device_id: Some(device_id),
+            });
         }
     }
 
@@ -10612,9 +10856,33 @@ impl App {
                         });
                     }
                 }
-                Request::Select { index } | Request::Play { index, .. } => {
+                Request::Select { index } => {
                     if index < self.rotation.order.len() {
                         self.rotation.current_index = index;
+                    }
+                }
+                Request::Play { index, device_id } => {
+                    if index < self.rotation.order.len() {
+                        self.rotation.current_index = index;
+                        let mut device = self
+                            .devices
+                            .iter()
+                            .find(|device| device.id.as_deref() == Some(&device_id))
+                            .cloned()
+                            .unwrap_or_default();
+                        device.id = Some(device_id);
+                        device.is_active = true;
+                        self.rotation.playback = Some(PlaybackState {
+                            device: Some(device),
+                            repeat_state: "off".into(),
+                            is_playing: true,
+                            item: self
+                                .rotation
+                                .current()
+                                .map(|entry| PlayableItem::Track(entry.track.clone())),
+                            progress_ms: Some(0),
+                            ..Default::default()
+                        });
                     }
                 }
                 Request::Finish { .. } => self.rotation.current_index = self.rotation.order.len(),
@@ -10701,10 +10969,40 @@ impl App {
             self.supersede_play_search();
         }
         match action {
-            Action::Rotation(request) => self.send_rotation(request),
+            Action::RotationTurnOn => self.play_rotation(self.rotation.current_index),
+            Action::RotationTurnOff => self.leave_rotation_mode(),
+            Action::RotationRemoveCurrent => {
+                if self.rotation_can_remove() {
+                    crate::ui::rotation::request_removal(self, ctx);
+                }
+            }
+            Action::Rotation(request) => {
+                if let crate::rotation::Request::Remove {
+                    item_key,
+                    without_archive: false,
+                } = &request
+                    && (!self.rotation_can_remove()
+                        || self
+                            .rotation
+                            .current()
+                            .is_none_or(|entry| entry.key != *item_key))
+                {
+                    return;
+                }
+                if matches!(
+                    request,
+                    crate::rotation::Request::Configure { .. }
+                        | crate::rotation::Request::Restart
+                        | crate::rotation::Request::ResolveReload
+                ) {
+                    self.leave_rotation_mode();
+                }
+                self.send_rotation(request);
+            }
             Action::RotationPlay(index) => self.play_rotation(index),
             Action::RotationSelectDevice(device) => {
                 if !self.rotation_busy {
+                    self.leave_rotation_mode();
                     self.rotation_device = Some(device);
                     self.rotation_error = None;
                 }
@@ -10767,6 +11065,7 @@ impl App {
             // Taking the serial here, not when the command arrives, keeps
             // a play queued before it from superseding it.
             Action::PlaySearch { kind, query } => {
+                self.leave_rotation_mode();
                 self.play_search_serial = self.play_search_serial.wrapping_add(1);
                 self.backend.api(ApiRequest::PlaySearch {
                     kind,
@@ -10869,6 +11168,9 @@ impl App {
                 // which every shuffled play goes through.
                 self.play_request(PlayRequest::context(uri), true);
             }
+            Action::TogglePlay if self.rotation_active => self.rotation_toggle_play(),
+            Action::Next if self.rotation_active => self.rotation_step(true),
+            Action::Previous if self.rotation_active => self.rotation_step(false),
             Action::TogglePlay => self.toggle_play(),
             Action::Next if self.resume_only() => {
                 self.step_resume(true);
@@ -10950,17 +11252,25 @@ impl App {
                 }
             }
             Action::ToggleShuffle => {
+                self.leave_rotation_mode();
                 let shuffle = self
                     .now_playing()
                     .map_or(self.shuffle_wanted, |now| now.shuffle);
                 self.set_shuffle(!shuffle);
             }
-            Action::SetShuffle(shuffle) => self.set_shuffle(shuffle),
+            Action::SetShuffle(shuffle) => {
+                self.leave_rotation_mode();
+                self.set_shuffle(shuffle);
+            }
             Action::CycleRepeat => {
+                self.leave_rotation_mode();
                 let mode = self.now_playing().map(|now| now.repeat).unwrap_or_default();
                 self.set_repeat(mode.next());
             }
-            Action::SetRepeat(mode) => self.set_repeat(mode),
+            Action::SetRepeat(mode) => {
+                self.leave_rotation_mode();
+                self.set_repeat(mode);
+            }
             Action::AddToQueue { uri, label } => self.add_to_queue(uri, label),
             Action::QueueMany { songs } => self.queue_many(songs),
             Action::PlayNext { items } => {
@@ -11307,10 +11617,12 @@ impl App {
                     .api(ApiRequest::FollowPlaylist { id, follow: false });
             }
             Action::Transfer(device_id) => {
+                self.leave_rotation_mode();
                 self.remember_device_choice(&device_id);
                 self.transfer(device_id);
             }
             Action::ActivateReceiver(receiver) => {
+                self.leave_rotation_mode();
                 if self.activating_receiver.is_none() {
                     if let Some(key) = receiver.preference_key() {
                         self.remember_device_choice(&key);
@@ -20130,6 +20442,317 @@ mod tests {
                 .as_deref(),
             Some("new")
         );
+        app.backend.shutdown();
+    }
+
+    fn rotation_mode_fixture(name: &str) -> App {
+        let mut app = test_app(name);
+        app.user = Some(User {
+            id: "listener".into(),
+            ..Default::default()
+        });
+        app.rotation = crate::rotation::State::demo(
+            Playlist {
+                id: "source".into(),
+                ..Default::default()
+            },
+            None,
+            (0..3)
+                .map(|index| Track {
+                    uri: format!("spotify:track:song{index}"),
+                    duration_ms: 180_000,
+                    ..Default::default()
+                })
+                .collect(),
+        );
+        app.rotation_device = Some("rotation-device".into());
+        app
+    }
+
+    #[test]
+    fn rotation_mode_uses_normal_transport_without_popping_normal_queue() {
+        let mut app = rotation_mode_fixture("rotation-mode-transport");
+        app.offline = true;
+        app.queued_play = Some(PlayRequest::context("spotify:playlist:old"));
+        let serial = app.play_search_serial;
+        let ctx = egui::Context::default();
+        app.apply(Action::RotationTurnOn, &ctx);
+        assert!(app.rotation_active);
+        assert!(app.queued_play.is_none());
+        assert_ne!(app.play_search_serial, serial);
+        app.apply(Action::Next, &ctx);
+        assert_eq!(app.rotation.current_index, 1);
+        app.apply(Action::Previous, &ctx);
+        assert_eq!(app.rotation.current_index, 0);
+        assert!(app.rotation_active);
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn rotation_normal_pause_resume_and_previous_preserve_position_contract() {
+        let mut app = rotation_mode_fixture("rotation-mode-pause-resume");
+        app.offline = true;
+        let ctx = egui::Context::default();
+        app.apply(Action::RotationTurnOn, &ctx);
+        app.rotation.playback.as_mut().unwrap().progress_ms = Some(45_000);
+        app.apply(Action::TogglePlay, &ctx);
+        assert!(!app.rotation.playback.as_ref().unwrap().is_playing);
+        app.apply(Action::TogglePlay, &ctx);
+        assert!(app.rotation.playback.as_ref().unwrap().is_playing);
+        assert_eq!(
+            app.rotation.playback.as_ref().unwrap().progress_ms,
+            Some(45_000)
+        );
+        app.apply(Action::Next, &ctx);
+        app.rotation.playback.as_mut().unwrap().progress_ms = Some(45_000);
+        app.apply(Action::Previous, &ctx);
+        assert_eq!(app.rotation.current_index, 1);
+        assert_eq!(app.rotation.playback.as_ref().unwrap().progress_ms, Some(0));
+        app.apply(Action::Previous, &ctx);
+        assert_eq!(app.rotation.current_index, 0);
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn rotation_previous_uses_elapsed_position_between_observations() {
+        let mut app = rotation_mode_fixture("rotation-previous-elapsed");
+        app.offline = true;
+        let ctx = egui::Context::default();
+        app.apply(Action::RotationTurnOn, &ctx);
+        app.apply(Action::Next, &ctx);
+        app.rotation_playback_received_at = Instant::now() - Duration::from_millis(3_500);
+        assert!(app.now_playing().unwrap().position_ms >= 3_500);
+        app.apply(Action::Previous, &ctx);
+        assert_eq!(
+            app.rotation.current_index, 1,
+            "restart the audible song first"
+        );
+        assert_eq!(app.rotation.playback.as_ref().unwrap().progress_ms, Some(0));
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn rotation_mode_exits_at_normal_play_and_search_intent() {
+        let mut app = rotation_mode_fixture("rotation-mode-exit");
+        app.offline = true;
+        let ctx = egui::Context::default();
+        for action in [
+            Action::PlayContext {
+                uri: "spotify:playlist:ordinary".into(),
+                offset_uri: None,
+                offset_index: None,
+            },
+            Action::PlayUris {
+                uris: vec!["spotify:track:ordinary".into()],
+                index: 0,
+            },
+            Action::PlaySearch {
+                kind: "track".into(),
+                query: "song".into(),
+            },
+            Action::PlayFromRow {
+                context: RowContext::Queue,
+                uri: "spotify:track:ordinary".into(),
+                index: 0,
+            },
+        ] {
+            app.rotation_active = true;
+            app.apply(action, &ctx);
+            assert!(!app.rotation_active);
+        }
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn rotation_completed_remove_after_exit_updates_caches_without_restarting() {
+        let mut app = rotation_mode_fixture("rotation-mode-remove-exit");
+        app.rotation_busy = true;
+        app.rotation_active = true;
+        app.rotation_advance_after_remove = true;
+        app.playlist_pages
+            .insert("source".into(), PlaylistPage::default());
+        let mut state = app.rotation.clone();
+        state.operation = Some(crate::rotation::Operation {
+            item_key: state.current().unwrap().key.clone(),
+            stage: crate::rotation::Stage::Complete,
+        });
+        app.leave_rotation_mode();
+        app.handle_backend_events(vec![Event::Rotation {
+            request: app.rotation_request,
+            account_id: "listener".into(),
+            result: Ok(Box::new(state)),
+        }]);
+        assert!(!app.rotation_active);
+        assert!(!app.rotation_busy);
+        assert!(!app.rotation_playback_pending);
+        assert!(!app.playlist_pages.contains_key("source"));
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn rotation_last_removal_stops_only_while_mode_is_still_active() {
+        let mut app = rotation_mode_fixture("rotation-last-remove");
+        app.rotation_active = true;
+        app.rotation_busy = true;
+        app.rotation_advance_after_remove = true;
+        let mut state = app.rotation.clone();
+        state.operation = Some(crate::rotation::Operation {
+            item_key: state.current().unwrap().key.clone(),
+            stage: crate::rotation::Stage::Complete,
+        });
+        state.current_index = state.order.len();
+        app.handle_backend_events(vec![Event::Rotation {
+            request: app.rotation_request,
+            account_id: "listener".into(),
+            result: Ok(Box::new(state.clone())),
+        }]);
+        assert!(app.rotation_active);
+        assert!(app.rotation_busy);
+        assert!(app.rotation_transport_pending);
+        app.handle_backend_events(vec![Event::Rotation {
+            request: app.rotation_request,
+            account_id: "listener".into(),
+            result: Ok(Box::new(state)),
+        }]);
+        assert!(!app.rotation_active);
+        assert!(!app.rotation_busy);
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn rotation_paused_outside_song_observation_exits_mode_and_restores_controls() {
+        let mut app = rotation_mode_fixture("rotation-outside-observation");
+        app.rotation_active = true;
+        app.rotation_busy = true;
+        app.rotation_transport_pending = true;
+        let mut state = app.rotation.clone();
+        state.playback = Some(PlaybackState {
+            device: Some(Device {
+                id: app.rotation_device.clone(),
+                is_active: true,
+                ..Default::default()
+            }),
+            repeat_state: "off".into(),
+            item: Some(PlayableItem::Track(Track {
+                uri: "spotify:track:ordinary".into(),
+                ..Default::default()
+            })),
+            is_playing: false,
+            ..Default::default()
+        });
+        app.handle_backend_events(vec![Event::Rotation {
+            request: app.rotation_request,
+            account_id: "listener".into(),
+            result: Ok(Box::new(state)),
+        }]);
+        assert!(!app.rotation_active);
+        assert!(!app.rotation_busy);
+        assert!(!app.rotation_can_remove());
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn rotation_exit_drops_transport_callbacks_but_does_not_lock_configuration() {
+        let mut app = rotation_mode_fixture("rotation-canceled-transport");
+        app.rotation_active = true;
+        app.rotation_busy = true;
+        app.rotation_transport_pending = true;
+        let request = app.rotation_request;
+        app.leave_rotation_mode();
+        assert!(!app.rotation_busy);
+        app.handle_backend_events(vec![Event::Rotation {
+            request,
+            account_id: "listener".into(),
+            result: Ok(Box::new(app.rotation.clone())),
+        }]);
+        assert!(!app.rotation_active);
+        assert!(!app.rotation_loaded);
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn rotation_confirmation_queued_before_mode_exit_cannot_prune_after_exit() {
+        let mut app = rotation_mode_fixture("rotation-stale-removal-confirmation");
+        app.rotation_active = true;
+        app.rotation.playback = Some(PlaybackState {
+            device: Some(Device {
+                id: app.rotation_device.clone(),
+                is_active: true,
+                ..Default::default()
+            }),
+            repeat_state: "off".into(),
+            item: Some(PlayableItem::Track(
+                app.rotation.current().unwrap().track.clone(),
+            )),
+            ..Default::default()
+        });
+        let confirmation = Action::Rotation(crate::rotation::Request::Remove {
+            item_key: app.rotation.current().unwrap().key.clone(),
+            without_archive: false,
+        });
+        let request = app.rotation_request;
+        let ctx = egui::Context::default();
+        app.apply(Action::RotationTurnOff, &ctx);
+        app.apply(confirmation, &ctx);
+        assert!(!app.rotation_busy);
+        assert_eq!(app.rotation_request, request);
+        assert!(app.rotation.operation.is_none());
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn rotation_footer_remove_waits_for_confirmation_before_submitting_edit() {
+        let mut app = rotation_mode_fixture("rotation-mode-remove-confirmation");
+        app.rotation_active = true;
+        app.rotation.playback = Some(PlaybackState {
+            device: Some(Device {
+                id: app.rotation_device.clone(),
+                is_active: true,
+                ..Default::default()
+            }),
+            repeat_state: "off".into(),
+            item: Some(PlayableItem::Track(
+                app.rotation.current().unwrap().track.clone(),
+            )),
+            ..Default::default()
+        });
+        let before = app.rotation.order.clone();
+        let request = app.rotation_request;
+        app.apply(Action::RotationRemoveCurrent, &egui::Context::default());
+        assert!(!app.rotation_busy);
+        assert_eq!(app.rotation_request, request);
+        assert_eq!(app.rotation.order, before);
+        assert!(app.rotation.operation.is_none());
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn rotation_mode_removal_requires_matching_observed_song_and_device() {
+        let mut app = rotation_mode_fixture("rotation-mode-remove-guard");
+        app.rotation_active = true;
+        assert!(!app.rotation_can_remove());
+        app.rotation.playback = Some(PlaybackState {
+            device: Some(Device {
+                id: app.rotation_device.clone(),
+                is_active: true,
+                ..Default::default()
+            }),
+            repeat_state: "off".into(),
+            item: Some(PlayableItem::Track(
+                app.rotation.current().unwrap().track.clone(),
+            )),
+            ..Default::default()
+        });
+        assert!(app.rotation_can_remove());
+        app.rotation
+            .playback
+            .as_mut()
+            .unwrap()
+            .device
+            .as_mut()
+            .unwrap()
+            .id = Some("ordinary-device".into());
+        assert!(!app.rotation_can_remove());
         app.backend.shutdown();
     }
 

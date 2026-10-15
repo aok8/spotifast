@@ -669,6 +669,8 @@ pub fn autostart() -> fastframe_autostart::Autostart {
 }
 
 pub enum Command {
+    /// Leaving Rotation cancels transport, without interrupting playlist edits.
+    RotationExit,
     Rotation {
         request: u64,
         action: crate::rotation::Request,
@@ -1754,6 +1756,27 @@ impl PlaylistHeaderLookup {
     }
 }
 
+/// Session changes cancel every job; mode changes cancel only transport.
+/// The biased branches also prevent queued work from starting after an exit.
+async fn rotation_until_cancelled<T>(
+    mut session: watch::Receiver<u64>,
+    mut transport: Option<watch::Receiver<u64>>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = session.changed() => None,
+        _ = async {
+            if let Some(transport) = transport.as_mut() {
+                let _ = transport.changed().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => None,
+        result = work => Some(result),
+    }
+}
+
 struct Worker {
     dirs: AppDirs,
     credentials: CredentialStore,
@@ -1786,6 +1809,7 @@ struct Worker {
     receiver_discovery: Option<tokio::task::JoinHandle<()>>,
     background_session: Arc<tokio::sync::Semaphore>,
     rotation_lock: Arc<tokio::sync::Mutex<()>>,
+    rotation_transport_generation: watch::Sender<u64>,
     art: ArtLoader,
     events: std::sync::mpsc::Sender<Event>,
     commands: mpsc::UnboundedSender<Command>,
@@ -1906,6 +1930,7 @@ impl Worker {
             receiver_discovery: None,
             background_session: Arc::new(tokio::sync::Semaphore::new(4)),
             rotation_lock: Arc::default(),
+            rotation_transport_generation: watch::channel(0).0,
             http,
             friend_names: Arc::default(),
             art,
@@ -2129,6 +2154,10 @@ impl Worker {
                         waker.wake();
                     });
                 }
+                Command::RotationExit => {
+                    self.rotation_transport_generation
+                        .send_modify(|generation| *generation = generation.wrapping_add(1));
+                }
                 Command::Rotation { request, action } => {
                     let Some(account) = self.api.account() else {
                         self.emit(Event::Rotation {
@@ -2142,17 +2171,20 @@ impl Worker {
                     let api = self.api.clone();
                     let root = self.dirs.state.clone();
                     let lock = self.rotation_lock.clone();
-                    let mut generation = self.session.subscribe();
+                    let generation = self.session.subscribe();
+                    let transport = action
+                        .is_transport()
+                        .then(|| self.rotation_transport_generation.subscribe());
                     let events = self.events.clone();
                     let waker = self.waker.clone();
                     tokio::spawn(async move {
-                        let result = tokio::select! {
-                            biased;
-                            _ = generation.changed() => return,
-                            result = async {
-                                let guard = Arc::new(lock.lock_owned().await);
-                                crate::rotation::execute(&api, &root, &account_id, action, guard).await
-                            } => result,
+                        let Some(result) = rotation_until_cancelled(generation, transport, async {
+                            let guard = Arc::new(lock.lock_owned().await);
+                            crate::rotation::execute(&api, &root, &account_id, action, guard).await
+                        })
+                        .await
+                        else {
+                            return;
                         };
                         if api.account().as_ref().map(|id| id.as_str()) == Some(account_id.as_str())
                         {
@@ -9132,6 +9164,80 @@ mod cover_routing_tests {
         assert_eq!(
             operation_for(&api, &request),
             Operation::PlaylistMutation(PlaylistAccess::Collaborative)
+        );
+    }
+}
+
+#[cfg(test)]
+mod rotation_mode_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rotation_exit_cancels_queued_transport_before_it_can_send() {
+        let (_session, session) = watch::channel(0);
+        let (mode, transport) = watch::channel(0);
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        mode.send_modify(|value| *value += 1);
+        let result = rotation_until_cancelled(session, Some(transport), async {
+            sent.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+        assert!(result.is_none());
+        assert!(!sent.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn rotation_exit_cancels_waiting_transport_but_preserves_playlist_edits() {
+        let (_session, session) = watch::channel(0);
+        let (mode, transport) = watch::channel(0);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let transport_job = tokio::spawn(rotation_until_cancelled(
+            session.clone(),
+            Some(transport),
+            async {
+                let _ = started.send(());
+                std::future::pending::<()>().await;
+            },
+        ));
+        ready.await.unwrap();
+        mode.send_modify(|value| *value += 1);
+        assert!(transport_job.await.unwrap().is_none());
+
+        // A removal awaiting the serialized writer must still settle after exit.
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let held = lock.clone().lock_owned().await;
+        let edit = tokio::spawn(rotation_until_cancelled(session, None, async move {
+            let _write = lock.lock_owned().await;
+            "saved removal"
+        }));
+        mode.send_modify(|value| *value += 1);
+        drop(held);
+        assert_eq!(edit.await.unwrap(), Some("saved removal"));
+    }
+
+    #[test]
+    fn rotation_removal_and_recovery_are_not_transport() {
+        use crate::rotation::Request;
+        assert!(
+            !Request::Remove {
+                item_key: "0:spotify:track:song".into(),
+                without_archive: false
+            }
+            .is_transport()
+        );
+        assert!(!Request::Retry.is_transport());
+        assert!(
+            Request::Play {
+                index: 0,
+                device_id: "speaker".into()
+            }
+            .is_transport()
+        );
+        assert!(
+            Request::StopRemoved {
+                device_id: "speaker".into()
+            }
+            .is_transport()
         );
     }
 }

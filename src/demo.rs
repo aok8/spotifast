@@ -1083,7 +1083,20 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
     }
     for surface in show.unwrap_or("").split(',').map(str::trim) {
         match surface {
+            "rotation-ready" | "rotation-active" | "rotation-confirmation" => {
+                app.rotation_device = Some("remote1".into());
+                app.rotation_active = surface != "rotation-ready";
+                if let Some(remote) = &mut app.remote {
+                    remote.state.shuffle_state = false;
+                    remote.state.repeat_state = "off".into();
+                    app.rotation.playback = Some(remote.state.clone());
+                }
+                if surface == "rotation-confirmation" {
+                    app.actions.push(Action::RotationRemoveCurrent);
+                }
+            }
             "rotation-paused" => {
+                app.rotation_active = true;
                 app.rotation_device = Some("remote1".into());
                 if let Some(remote) = &mut app.remote {
                     remote.state.is_playing = false;

@@ -1030,6 +1030,9 @@ pub enum Action {
     /// The isolated Rotation playlist workflow.
     Rotation(crate::rotation::Request),
     RotationPlay(usize),
+    RotationTurnOn,
+    RotationTurnOff,
+    RotationRemoveCurrent,
     RotationSelectDevice(String),
     Open(Page),
     /// Opens the radio of a song shown in a list, after caching the row's
