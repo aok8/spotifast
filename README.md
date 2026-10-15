@@ -48,7 +48,7 @@ https://github.com/user-attachments/assets/a5f669ce-b3b7-4f8e-9933-976a78876c7e
 | Feature | What you can do |
 |---|---|
 | **Library and search** | Browse playlists, Liked Songs, albums, artists, and podcasts. Search the catalogue and edit playlists you own. |
-| **Rotation** | Work through a saved shuffled playlist, with an optional history playlist and guarded Remove and skip. |
+| **Rotation** | Turn on a saved shuffled playlist and use the normal player controls. Its shuffle button becomes **X** for guarded Remove and skip, with an optional history playlist. |
 | **Spotify Connect** | Play on this computer or control playback on your other devices, including Google Cast speakers and groups. |
 | **Themes** | Choose light, dark, system appearance, or custom colours. On Omarchy, follow your desktop theme. |
 | **Desktop controls** | Use keyboard shortcuts and media keys. Keep music playing from the tray when supported by your desktop and settings. |

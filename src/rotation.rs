@@ -50,6 +50,22 @@ pub enum Request {
     },
     Retry,
 }
+impl Request {
+    /// Playback work belongs to the currently enabled mode. Playlist edits
+    /// survive leaving that mode so their durable recovery markers settle.
+    pub(crate) fn is_transport(&self) -> bool {
+        matches!(
+            self,
+            Self::Play { .. }
+                | Self::Pause { .. }
+                | Self::Resume { .. }
+                | Self::Seek { .. }
+                | Self::StopRemoved { .. }
+                | Self::Finish { .. }
+                | Self::Sync
+        )
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Entry {
     pub key: String,
@@ -747,20 +763,26 @@ async fn player<T: PlayerTransport>(
                             && live.repeat_state == "off"
                     }) {
                         return Err(
-                            "Spotify did not confirm Shuffle and Repeat off. Try Play again."
+                            "Spotify did not confirm Shuffle and Repeat off. Turn on Rotation again."
                                 .into(),
                         );
                     }
                 }
                 verified_modes = true;
             }
-            let end_index = index
+            let max_end = index
                 .saturating_add(if verified_modes { 20 } else { 1 })
                 .min(state.order.len());
-            let uris: Vec<_> = state.ordered_items()[*index..end_index]
+            // Spotify reports a URI, not a playlist occurrence. Keep the
+            // submitted window unique so repeated songs can still be selected
+            // deliberately with Next without making every observation ambiguous.
+            let mut seen = std::collections::HashSet::new();
+            let uris: Vec<_> = state.ordered_items()[*index..max_end]
                 .iter()
                 .map(|entry| entry.track.uri.clone())
+                .take_while(|uri| seen.insert(uri.clone()))
                 .collect();
+            let end_index = index.saturating_add(uris.len());
             api_client
                 .start(device, &uris)
                 .await
@@ -790,7 +812,7 @@ async fn player<T: PlayerTransport>(
                 }
                 tokio::time::sleep(Duration::from_millis(700)).await;
             }
-            Err("Play was accepted, but playback on the selected device is unconfirmed. Press Play to try again.".into())
+            Err("Play was accepted, but playback on the selected device is unconfirmed. Turn on Rotation again to try.".into())
         }
         Request::Pause { .. } | Request::Resume { .. } | Request::Seek { .. } => {
             let entry = state
@@ -816,7 +838,7 @@ async fn player<T: PlayerTransport>(
                 .is_some_and(|live| live.shuffle_state || live.repeat_state != "off")
             {
                 return Err(
-                    "Playback modes changed. Press Rotation Play to restore its order.".into(),
+                    "Playback modes changed. Turn on Rotation again to restore its order.".into(),
                 );
             }
             match request {
@@ -935,7 +957,7 @@ fn synced_index(
         || live.repeat_state != "off"
     {
         return Err(
-            "Rotation playback changed devices or modes. Press Play to restore its order.".into(),
+            "Rotation playback changed devices or modes. Turn on Rotation again to restore its order.".into(),
         );
     }
     let Some(uri) = live.item.as_ref().map(PlayableItem::uri) else {
@@ -946,7 +968,9 @@ fn synced_index(
     }
     let ordered = state.ordered_items();
     let Some(entries) = ordered.get(window.start_index..window.end_index) else {
-        return Err("The saved Rotation playback window is invalid. Press Play again.".into());
+        return Err(
+            "The saved Rotation playback window is invalid. Turn on Rotation again.".into(),
+        );
     };
     let matches: Vec<_> = entries
         .iter()
@@ -957,8 +981,8 @@ fn synced_index(
     match matches.as_slice() {
         [index] if *index>state.current_index=>Ok(Some(*index)),
         [_]=>Ok(None),
-        []=>Err("The selected device is playing outside Rotation. Press Play to restore its order.".into()),
-        _=>Err("This song appears more than once in the playback window. Use Rotation Next to choose the next occurrence.".into()),
+        []=>Err("The selected device is playing outside Rotation. Turn on Rotation again to restore its order.".into()),
+        _=>Err("This song appears more than once in the playback window. Turn on Rotation again to choose its saved occurrence.".into()),
     }
 }
 async fn sync(api: &ApiGateway, path: &Path, state: &mut State) -> Result<(), String> {
@@ -1015,16 +1039,7 @@ async fn execute_inner(
     let path = state_path(root, account);
     let mut state = load(&path, account).await?;
     state.error = None;
-    let playback_request = matches!(
-        &request,
-        Request::Play { .. }
-            | Request::Pause { .. }
-            | Request::Resume { .. }
-            | Request::Seek { .. }
-            | Request::StopRemoved { .. }
-            | Request::Finish { .. }
-            | Request::Sync
-    );
+    let playback_request = request.is_transport();
     if playback_request && state.playback_cooldown_until > now_seconds() {
         state.error = Some(
             "Playback is cooling down after an uncertain request. Try again in a few seconds."
@@ -2074,6 +2089,56 @@ mod tests {
             assert_eq!(state.current().unwrap().track.uri, "spotify:track:3");
             clean_playback(&path).await;
         }
+    }
+    #[tokio::test]
+    async fn repeated_occurrences_stay_navigable_without_ambiguous_play_windows() {
+        let rows = vec![
+            row("spotify:track:a", true),
+            row("spotify:track:b", true),
+            row("spotify:track:a", true),
+            row("spotify:track:c", true),
+        ];
+        let mut state = state(&rows);
+        let path = playback_path("unique-occurrence-window");
+        for (index, expected, end) in [
+            (0, vec!["spotify:track:a", "spotify:track:b"], 2),
+            (2, vec!["spotify:track:a", "spotify:track:c"], 4),
+        ] {
+            let fake = fake_player(
+                false,
+                vec![
+                    Some(live("chosen", "spotify:track:a")),
+                    Some(live("chosen", "spotify:track:a")),
+                ],
+            );
+            player(
+                &fake,
+                &path,
+                &mut state,
+                &Request::Play {
+                    index,
+                    device_id: "chosen".into(),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(fake.submitted.lock().unwrap()[0], expected);
+            assert_eq!(state.queued_window.as_ref().unwrap().end_index, end);
+            assert_eq!(
+                synced_index(&state, &live("chosen", "spotify:track:a")).unwrap(),
+                None
+            );
+            assert_eq!(
+                state.order.len(),
+                4,
+                "both occurrences remain in the saved order"
+            );
+        }
+        assert_eq!(
+            synced_index(&state, &live("chosen", "spotify:track:c")).unwrap(),
+            Some(3)
+        );
+        clean_playback(&path).await;
     }
     #[test]
     fn restarting_and_removing_invalidate_old_playback_windows() {

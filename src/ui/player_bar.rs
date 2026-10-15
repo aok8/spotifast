@@ -574,6 +574,72 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
     }
 }
 
+/// Both meanings keep one hit target and focus identity while their glyphs
+/// crossfade. A mode change never leaves a fading destructive control clickable.
+fn rotation_shuffle_button(
+    ui: &mut egui::Ui,
+    active: bool,
+    shuffle: bool,
+    (normal, hover, danger): (Color32, Color32, Color32),
+    label: &str,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(29.0, 29.0), Sense::click());
+    response.widget_info(|| {
+        if active {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+        } else {
+            egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), shuffle, label)
+        }
+    });
+    let amount = rotation_icon_amount(ui.ctx(), active);
+    if ui.is_rect_visible(rect) {
+        let hovered = response.hovered() || response.has_focus();
+        let press = if response.is_pointer_button_down_on() {
+            0.92
+        } else {
+            1.0
+        };
+        if amount < 1.0 {
+            theme::paint_icon(
+                ui,
+                Icon::Shuffle,
+                rect,
+                17.0 * (1.0 - amount * 0.18) * press,
+                (if hovered { hover } else { normal }).gamma_multiply(1.0 - amount),
+            );
+        }
+        if amount > 0.0 {
+            theme::paint_icon(
+                ui,
+                Icon::X,
+                rect,
+                17.0 * (0.82 + amount * 0.18) * press,
+                danger.gamma_multiply(amount),
+            );
+        }
+    }
+    theme::focus_ring(ui, &response);
+    response.on_hover_text(label)
+}
+
+fn rotation_icon_amount(ctx: &egui::Context, active: bool) -> f32 {
+    let pass = ctx.cumulative_pass_nr();
+    let session = ctx.data_mut(|data| {
+        *data.get_temp_mut_or_insert_with(egui::Id::new(TINT_SESSION_ID), || pass)
+    });
+    let id = egui::Id::new(("rotation-shuffle-icon", session));
+    let target = if active { 1.0 } else { 0.0 };
+    let seconds = crate::motion::seconds(ctx, 0.18);
+    if seconds == 0.0 {
+        // Keep egui's stored value in step so re-enabling animation does not
+        // briefly resurrect a glyph that was already replaced.
+        ctx.animate_value_with_time(id, target, 0.0);
+        target
+    } else {
+        ctx.animate_value_with_time(id, target, seconds)
+    }
+}
+
 fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region: Rect) {
     let palette = app.palette;
     // Everything here is placed with explicit rects: egui's implicit rows
@@ -617,31 +683,42 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region:
 
     let shuffle_color = if shuffle { palette.accent } else { dim };
     let mut cell = centered(ui, slot(widths[0]));
-    let shuffle_button = theme::icon_button(
-        &mut cell,
-        Icon::Shuffle,
-        17.0,
-        shuffle_color,
-        if shuffle {
-            palette.accent_hover
-        } else {
-            palette.text
-        },
-        &gettext(app.locale, "Shuffle"),
-    );
-    shuffle_button.widget_info(|| {
-        egui::WidgetInfo::selected(
-            egui::WidgetType::Checkbox,
-            cell.is_enabled(),
+    let rotation_active = app.rotation_active;
+    let label = if rotation_active {
+        "Remove and skip".to_owned()
+    } else {
+        gettext(app.locale, "Shuffle").into_owned()
+    };
+    let ready = !rotation_active || app.rotation_can_remove();
+    cell.add_enabled_ui(ready, |ui| {
+        let button = rotation_shuffle_button(
+            ui,
+            rotation_active,
             shuffle,
-            gettext(app.locale, "Shuffle"),
-        )
+            (
+                shuffle_color,
+                if shuffle {
+                    palette.accent_hover
+                } else {
+                    palette.text
+                },
+                palette.danger,
+            ),
+            &label,
+        );
+        if button.clicked() {
+            app.actions.push(if rotation_active {
+                Action::RotationRemoveCurrent
+            } else {
+                Action::ToggleShuffle
+            });
+        }
     });
-    if shuffle_button.clicked() {
-        app.actions.push(Action::ToggleShuffle);
-    }
 
     let mut cell = centered(ui, slot(widths[1]));
+    if rotation_active && !app.rotation_transport_ready() {
+        cell.disable();
+    }
     if theme::icon_button(
         &mut cell,
         Icon::SkipBackFilled,
@@ -656,7 +733,7 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region:
     }
 
     let disc = slot(widths[2]);
-    if loading || app.any_play_pending() {
+    if loading || app.any_play_pending() || app.rotation_playback_pending {
         ui.painter()
             .circle_filled(disc.center(), 18.0, palette.text);
         let mut cell = centered(ui, disc);
@@ -673,6 +750,9 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region:
             palette.text
         };
         let mut cell = centered(ui, disc);
+        if rotation_active && !app.rotation_transport_ready() {
+            cell.disable();
+        }
         if theme::circle_button(
             &mut cell,
             icon,
@@ -693,6 +773,9 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region:
     }
 
     let mut cell = centered(ui, slot(widths[3]));
+    if rotation_active && !app.rotation_transport_ready() {
+        cell.disable();
+    }
     if theme::icon_button(
         &mut cell,
         Icon::SkipForwardFilled,
@@ -768,6 +851,9 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region:
             .max_rect(slider_rect)
             .layout(Layout::left_to_right(Align::Center)),
     );
+    if rotation_active && !app.rotation_transport_ready() {
+        slider_ui.disable();
+    }
     let fraction = if duration > 0 {
         position as f32 / duration as f32
     } else {
@@ -961,6 +1047,90 @@ mod player_bar_tint_tests {
         );
         output.textures_delta.clear();
         fill
+    }
+
+    fn rotation_frame(ctx: &egui::Context, time: f64, active: bool) -> f32 {
+        let mut amount = -1.0;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            },
+            |ui| {
+                amount = rotation_icon_amount(ui.ctx(), active);
+            },
+        );
+        output.textures_delta.clear();
+        amount
+    }
+
+    #[test]
+    fn rotation_icon_animates_in_and_back_and_can_reverse_mid_transition() {
+        let ctx = egui::Context::default();
+        assert_eq!(rotation_frame(&ctx, 0.0, false), 0.0);
+        rotation_frame(&ctx, 0.1, true);
+        let entering = rotation_frame(&ctx, 0.16, true);
+        assert!(entering > 0.0 && entering < 1.0);
+        rotation_frame(&ctx, 0.17, false);
+        let leaving = rotation_frame(&ctx, 0.23, false);
+        assert!(leaving < entering);
+        assert_eq!(rotation_frame(&ctx, 0.6, false), 0.0);
+        rotation_frame(&ctx, 0.7, true);
+        assert_eq!(rotation_frame(&ctx, 1.0, true), 1.0);
+        rotation_frame(&ctx, 1.1, false);
+        assert_eq!(rotation_frame(&ctx, 1.4, false), 0.0);
+    }
+
+    #[test]
+    fn rotation_replacement_changes_accessible_meaning_before_animation_finishes() {
+        use egui::accesskit::Role;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        theme::install(&ctx);
+        let mut original_id = None;
+        for (time, active, label, role) in [
+            (0.0, false, "Shuffle", Role::CheckBox),
+            (0.1, true, "Remove and skip", Role::Button),
+            (0.11, false, "Shuffle", Role::CheckBox),
+        ] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| {
+                    rotation_shuffle_button(
+                        ui,
+                        active,
+                        false,
+                        (Color32::GRAY, Color32::WHITE, Color32::RED),
+                        label,
+                    );
+                },
+            );
+            output.textures_delta.clear();
+            let tree = output.platform_output.accesskit_update.unwrap();
+            let (id, node) = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .unwrap();
+            assert_eq!(node.role(), role);
+            if let Some(original) = original_id {
+                assert_eq!(*id, original);
+            } else {
+                original_id = Some(*id);
+            }
+        }
+    }
+
+    #[test]
+    fn reduced_motion_replaces_rotation_icon_immediately_in_both_directions() {
+        let ctx = egui::Context::default();
+        crate::motion::apply(&ctx, true);
+        assert_eq!(rotation_frame(&ctx, 0.0, false), 0.0);
+        assert_eq!(rotation_frame(&ctx, 0.1, true), 1.0);
+        assert_eq!(rotation_frame(&ctx, 0.2, false), 0.0);
     }
 
     #[test]
