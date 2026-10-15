@@ -287,18 +287,24 @@ fn picker(
             "Choose a playlist"
         });
     egui::ComboBox::from_id_salt(id)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .width(ui.available_width().min(420.0))
         .selected_text(label)
         .show_ui(ui, |ui| {
             ui.add(egui::TextEdit::singleline(filter).hint_text("Find a playlist"));
-            if allow_none {
-                ui.selectable_value(selected, None, "None");
+            if allow_none && ui.selectable_value(selected, None, "None").clicked() {
+                ui.close();
             }
             let filter = filter.to_lowercase();
             for playlist in playlists.iter().filter(|p| {
                 Some(p.id.as_str()) != excluded && p.name.to_lowercase().contains(&filter)
             }) {
-                ui.selectable_value(selected, Some(playlist.id.clone()), &playlist.name);
+                if ui
+                    .selectable_value(selected, Some(playlist.id.clone()), &playlist.name)
+                    .clicked()
+                {
+                    ui.close();
+                }
             }
             if playlists.is_empty() {
                 ui.label("No editable playlists loaded.");
@@ -630,6 +636,151 @@ mod tests {
         app.rotation.order = vec![app.rotation.items[0].key.clone()];
         app.actions.clear();
         app
+    }
+
+    #[test]
+    fn playlist_picker_keeps_filter_open_until_a_choice_is_clicked() {
+        for allow_none in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            theme::install(&ctx);
+            let playlists = vec![
+                Playlist {
+                    id: "alpha".into(),
+                    name: "Alpha".into(),
+                    ..Default::default()
+                },
+                Playlist {
+                    id: "beta".into(),
+                    name: "Beta".into(),
+                    ..Default::default()
+                },
+            ];
+            let mut selected = None;
+            let mut filter = String::new();
+            {
+                let mut frame = |events| {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(800.0, 600.0),
+                            )),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            egui::CentralPanel::default().show(ui, |ui| {
+                                picker(
+                                    ui,
+                                    "picker-test",
+                                    &playlists,
+                                    &mut selected,
+                                    &mut filter,
+                                    None,
+                                    allow_none,
+                                );
+                            });
+                        },
+                    );
+                    output.textures_delta.clear();
+                    output.platform_output.accesskit_update.unwrap()
+                };
+                let center = |tree: &egui::accesskit::TreeUpdate, label: &str| {
+                    let bounds = tree
+                        .nodes
+                        .iter()
+                        .find(|(_, node)| {
+                            (node.label() == Some(label)
+                                || node.value() == Some(label)
+                                || (label == "Find a playlist"
+                                    && node.role() == egui::accesskit::Role::TextInput))
+                                && node.bounds().is_some()
+                        })
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "missing {label}: {:?}",
+                                tree.nodes
+                                    .iter()
+                                    .map(|(_, node)| (node.role(), node.label(), node.value()))
+                                    .collect::<Vec<_>>()
+                            )
+                        })
+                        .1
+                        .bounds()
+                        .unwrap();
+                    egui::pos2(
+                        ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                        ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                    )
+                };
+                let click = |pos| {
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]
+                };
+                frame(vec![]);
+                let tree = frame(vec![]);
+                frame(click(center(
+                    &tree,
+                    if allow_none {
+                        "None"
+                    } else {
+                        "Choose a playlist"
+                    },
+                )));
+                let tree = frame(vec![]);
+                frame(click(center(&tree, "Find a playlist")));
+                assert!(
+                    egui::Popup::is_any_open(&ctx),
+                    "clicking the filter must keep the picker open"
+                );
+                let tree = frame(vec![egui::Event::Text("Beta".into())]);
+                assert!(
+                    !tree
+                        .nodes
+                        .iter()
+                        .any(|(_, node)| node.label() == Some("Alpha")),
+                    "typing filters the choices"
+                );
+                let target = center(&tree, "Beta");
+                frame(click(target));
+                assert!(
+                    !egui::Popup::is_any_open(&ctx),
+                    "choosing a playlist closes the picker"
+                );
+                let tree = frame(vec![]);
+                frame(click(center(&tree, "Beta")));
+                let tree = frame(vec![]);
+                if allow_none {
+                    frame(click(center(&tree, "None")));
+                    assert!(
+                        !egui::Popup::is_any_open(&ctx),
+                        "choosing None closes the history picker"
+                    );
+                } else {
+                    frame(click(egui::pos2(700.0, 500.0)));
+                    assert!(
+                        !egui::Popup::is_any_open(&ctx),
+                        "clicking outside closes the picker"
+                    );
+                }
+            }
+            assert_eq!(filter, "Beta");
+            assert_eq!(selected.as_deref(), (!allow_none).then_some("beta"));
+        }
     }
 
     #[test]
